@@ -181,15 +181,69 @@ while true; do
 done
 
 info "Running setup..."
-# Pass password via env var to avoid shell escaping issues with special characters
-export KIDSAFE_SETUP_PASS="$ADMIN_PASS"
-sudo -u $CHILD_USER --preserve-env=KIDSAFE_SETUP_PASS \
-    python3 "$KIDSAFE_DIR/kidsafe.py" setup \
-    --child "$CHILD_USER" \
-    --password-env KIDSAFE_SETUP_PASS \
-    --limit 120 \
-    --homepage "https://www.youtube.com/kids"
-unset KIDSAFE_SETUP_PASS
+# Set HOME so kidsafe.py writes config to the child's home directory
+# Use env to pass the password safely (avoids shell escaping issues)
+HOME="$CHILD_HOME" KIDSAFE_SETUP_PASS="$ADMIN_PASS" python3 -c "
+import os, json, hashlib, secrets, sqlite3
+from pathlib import Path
+
+config_dir = Path.home() / '.kidsafe'
+config_dir.mkdir(parents=True, exist_ok=True)
+config_file = config_dir / 'config.json'
+db_file = config_dir / 'activity.db'
+
+# Hash password
+password = os.environ['KIDSAFE_SETUP_PASS']
+salt = secrets.token_hex(16)
+hashed = hashlib.sha256((salt + password).encode()).hexdigest()
+
+# Load existing config or use defaults
+if config_file.exists():
+    config = json.loads(config_file.read_text())
+else:
+    config = {}
+
+config['child_user'] = '$CHILD_USER'
+config['admin_password_hash'] = f'{salt}:{hashed}'
+config['daily_limit_minutes'] = 120
+config['homepage'] = 'https://www.youtube.com/kids'
+
+# Ensure all default keys exist
+defaults = {
+    'admin_port': 8484, 'warning_minutes': 10,
+    'schedule': {'enabled': True, 'allowed_start': '07:00', 'allowed_end': '20:00'},
+    'firefox_kiosk': True,
+    'allowed_sites': ['youtube.com','youtu.be','pbskids.org','nickjr.com','disney.com',
+        'disneyplus.com','netflix.com','khanacademy.org','abcya.com','coolmathgames.com',
+        'starfall.com','typingclub.com','scratch.mit.edu','code.org'],
+    'blocked_sites': [], 'dns_provider': 'cleanbrowsing',
+    'dns_providers': {
+        'cleanbrowsing': 'https://doh.cleanbrowsing.org/doh/family-filter/',
+        'cloudflare_family': 'https://family.cloudflare-dns.com/dns-query',
+        'opendns': 'https://doh.familyshield.opendns.com/dns-query'
+    }
+}
+for k, v in defaults.items():
+    config.setdefault(k, v)
+
+config_file.write_text(json.dumps(config, indent=2))
+
+# Init database
+conn = sqlite3.connect(str(db_file))
+conn.execute('CREATE TABLE IF NOT EXISTS sessions (id INTEGER PRIMARY KEY AUTOINCREMENT, start_time TEXT NOT NULL, end_time TEXT, duration_seconds INTEGER DEFAULT 0)')
+conn.execute('CREATE TABLE IF NOT EXISTS daily_usage (date TEXT PRIMARY KEY, total_seconds INTEGER DEFAULT 0)')
+conn.execute('CREATE TABLE IF NOT EXISTS events (id INTEGER PRIMARY KEY AUTOINCREMENT, timestamp TEXT NOT NULL, event_type TEXT NOT NULL, detail TEXT)')
+conn.commit()
+conn.close()
+
+print('Config saved to ' + str(config_file))
+"
+
+# Fix ownership — installer runs as root but config belongs to child
+chown -R $CHILD_USER:staff "$CHILD_HOME/.kidsafe"
+
+# Apply Firefox policies (needs root for /Applications/Firefox.app)
+python3 "$KIDSAFE_DIR/kidsafe.py" policies
 ok "Setup complete"
 
 # --- Done ---
