@@ -46,16 +46,6 @@ info "Removing Firefox policies..."
 rm -f "/Applications/Firefox.app/Contents/Resources/distribution/policies.json"
 ok "Firefox policies removed"
 
-# Remove TCC accessibility permissions
-info "Removing Accessibility permissions..."
-TCC_DB="/Library/Application Support/com.apple.TCC/TCC.db"
-if [ -f "$TCC_DB" ]; then
-    for client in /usr/bin/python3 /usr/bin/osascript; do
-        sqlite3 "$TCC_DB" "DELETE FROM access WHERE service='kTCCServiceAccessibility' AND client='$client';" 2>/dev/null || true
-    done
-    ok "Accessibility permissions removed"
-fi
-
 # Remove MDM profile if installed
 if profiles list 2>/dev/null | grep -q "com.kidsafe.profile"; then
     info "Removing MDM profile..."

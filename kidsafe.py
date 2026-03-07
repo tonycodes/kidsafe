@@ -361,86 +361,58 @@ def apply_firefox_policies(config):
 # --- Firefox Kiosk Manager ---
 
 # --- App Enforcer (kills unauthorized apps) ---
+# Uses `ps` to find running .app processes — no Accessibility permissions needed.
 
-# Apps that are allowed to run (lowercase for case-insensitive matching).
-# Everything else gets force-quit.
-ALLOWED_APPS = {
-    # The browser
-    "firefox",
-    # Essential OS processes that appear as "apps"
-    "finder",
-    "dock",
-    "systemuiserver",
-    "loginwindow",
-    "notificationcenter",
-    "coreservicesuiagent",
-    "usernotificationcenter",
-    "spotlight",              # search UI (can't do much without Safari)
-    "securityagent",          # password prompts
-    "screensaverengine",
-    "airplayuiagent",
-    "wi-fi",
-    "textinputmenuagent",
-    "control center",
-    "notification center",
-    "talagent",               # text input
-    "universalcontrol",
-}
+import re
 
-# Process names that should never be killed (background daemons, not GUI apps)
-ALLOWED_PROCESS_NAMES = {
-    "python3", "python", "Python",  # KidSafe itself
-    "kidsafe", "kidsafe.py",
-    "launchd", "WindowServer", "loginwindow",
-    "Dock", "Finder", "SystemUIServer",
-    "cfprefsd", "distnoted", "UserEventAgent",
-    "sharedfilelistd", "trustd", "secd",
-    "coreauthd", "corebrightnessd",
-    "osascript",  # our own notification commands
+# .app bundles that are allowed to run (lowercase). Everything else from
+# /Applications/ or /System/Applications/ gets killed.
+ALLOWED_APP_BUNDLES = {
+    "firefox.app",
 }
 
 
-def get_running_apps():
-    """Get list of running GUI application names via AppleScript."""
+def find_unauthorized_apps():
+    """Find running .app processes that aren't in the allowed list.
+    Returns dict of {app_name: [pids]} for apps that should be killed.
+    No special permissions required — just reads `ps` output."""
     try:
         result = subprocess.run(
-            ["osascript", "-e",
-             'tell application "System Events" to get name of every application process whose background only is false'],
+            ["ps", "-eo", "pid,comm"],
             capture_output=True, text=True, timeout=5
         )
-        if result.returncode == 0 and result.stdout.strip():
-            return [app.strip() for app in result.stdout.strip().split(", ")]
     except Exception:
-        pass
-    return []
+        return {}
+
+    apps = {}  # {app_name: [pids]}
+    for line in result.stdout.strip().split("\n")[1:]:
+        parts = line.strip().split(None, 1)
+        if len(parts) < 2:
+            continue
+        pid_str, comm = parts
+        if "/Applications/" not in comm:
+            continue
+        m = re.search(r"/([^/]+\.app)/", comm)
+        if not m:
+            continue
+        app_name = m.group(1)
+        if app_name.lower() in ALLOWED_APP_BUNDLES:
+            continue
+        apps.setdefault(app_name, []).append(int(pid_str))
+    return apps
 
 
-def kill_app(app_name):
-    """Force-quit an app by name."""
-    try:
-        subprocess.run(
-            ["osascript", "-e",
-             f'tell application "{app_name}" to quit'],
-            capture_output=True, timeout=3
-        )
-        # If graceful quit didn't work, force kill
-        time.sleep(0.5)
-        subprocess.run(
-            ["pkill", "-f", app_name],
-            capture_output=True, timeout=3
-        )
-    except Exception:
-        pass
-
-
-def enforce_allowed_apps():
-    """Kill any GUI app not in the allowed list. Returns list of killed apps."""
+def kill_unauthorized_apps():
+    """Kill all unauthorized .app processes. Returns list of app names killed."""
+    apps = find_unauthorized_apps()
     killed = []
-    running = get_running_apps()
-    for app in running:
-        if app.lower() not in ALLOWED_APPS:
-            kill_app(app)
-            killed.append(app)
+    for app_name, pids in apps.items():
+        for pid in pids:
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except (ProcessLookupError, PermissionError):
+                pass
+        killed.append(app_name)
     return killed
 
 
@@ -464,7 +436,7 @@ class AppEnforcer:
     def _run(self):
         while self.running:
             try:
-                killed = enforce_allowed_apps()
+                killed = kill_unauthorized_apps()
                 for app in killed:
                     log(f"Killed unauthorized app: {app}")
                     record_event("app_blocked", app)
@@ -500,12 +472,45 @@ class KioskManager:
         remaining = max(0, limit - used)
         return remaining // 60
 
+    def hide_dock(self):
+        """Auto-hide the Dock so the child only sees Firefox."""
+        try:
+            subprocess.run(
+                ["osascript", "-e",
+                 'tell application "System Events" to set autohide of dock preferences to true'],
+                capture_output=True, timeout=5
+            )
+        except Exception:
+            pass
+
+    def ensure_firefox_fullscreen(self):
+        """Make sure Firefox is in fullscreen. Sends Cmd+Shift+F if not."""
+        try:
+            # Check if Firefox has a fullscreen window
+            result = subprocess.run(
+                ["osascript", "-e",
+                 'tell application "System Events" to tell process "firefox" to get value of attribute "AXFullScreen" of window 1'],
+                capture_output=True, text=True, timeout=3
+            )
+            if result.stdout.strip() == "false":
+                # Send Cmd+Shift+F to enter fullscreen
+                subprocess.run(
+                    ["osascript", "-e",
+                     'tell application "System Events" to tell process "firefox" to keystroke "f" using {command down, shift down}'],
+                    capture_output=True, timeout=3
+                )
+                log("Re-maximized Firefox to fullscreen")
+        except Exception:
+            pass
+
     def launch_firefox(self):
         """Launch Firefox in kiosk mode."""
         cmd = ["/Applications/Firefox.app/Contents/MacOS/firefox"]
         if self.config["firefox_kiosk"]:
             cmd.append("--kiosk")
         cmd.append(self.config["homepage"])
+
+        self.hide_dock()
 
         try:
             self.firefox_process = subprocess.Popen(
@@ -623,6 +628,10 @@ class KioskManager:
                     self.launch_firefox()
                     time.sleep(5)
                     continue
+
+                # Ensure Firefox stays fullscreen
+                if self.session_seconds % 5 == 0:
+                    self.ensure_firefox_fullscreen()
 
                 # Update usage tracking
                 if self.session_start:

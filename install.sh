@@ -96,38 +96,6 @@ chmod +x "$KIDSAFE_DIR/uninstall.sh"
 ln -sf "$KIDSAFE_DIR/kidsafe.py" /usr/local/bin/kidsafe
 ok "Installed to $KIDSAFE_DIR"
 
-# --- Grant Accessibility permissions for app enforcement ---
-
-info "Granting Accessibility permissions for app enforcement..."
-TCC_DB="/Library/Application Support/com.apple.TCC/TCC.db"
-if [ -f "$TCC_DB" ]; then
-    # Grant accessibility to python3 and osascript so the enforcer can
-    # list running apps and kill unauthorized ones via System Events
-    TCC_OK=true
-    for client in /usr/bin/python3 /usr/bin/osascript; do
-        sqlite3 "$TCC_DB" "DELETE FROM access WHERE service='kTCCServiceAccessibility' AND client='$client' AND client_type=1;" 2>/dev/null || true
-        sqlite3 "$TCC_DB" "INSERT OR REPLACE INTO access (service, client, client_type, auth_value, auth_reason, auth_version, indirect_object_identifier, boot_uuid) VALUES ('kTCCServiceAccessibility', '$client', 1, 2, 0, 1, 'UNUSED', 'UNUSED');" 2>/dev/null || TCC_OK=false
-    done
-    if $TCC_OK; then
-        ok "Accessibility permissions granted"
-    else
-        warn "Could not write to TCC database (SIP may be enabled)."
-        echo "  Grant permissions manually:"
-        echo "  System Preferences > Security & Privacy > Privacy > Accessibility"
-        echo "  Click '+' and add: /usr/bin/python3"
-        echo
-        echo "  Or disable SIP temporarily:"
-        echo "  1. Reboot into Recovery (Cmd+R at startup)"
-        echo "  2. Terminal > csrutil disable"
-        echo "  3. Reboot, re-run this installer"
-        echo "  4. Re-enable SIP: csrutil enable"
-    fi
-else
-    warn "Could not find TCC database — grant Accessibility permissions manually:"
-    echo "  System Preferences > Security & Privacy > Privacy > Accessibility"
-    echo "  Click '+' and add: /usr/bin/python3"
-fi
-
 # --- Setup child user ---
 
 CHILD_HOME=$(dscl . read /Users/$CHILD_USER NFSHomeDirectory | awk '{print $2}')
