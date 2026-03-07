@@ -167,11 +167,26 @@ PLISTEOF
     ok "Created dashboard LaunchAgent for admin ($ADMIN_USER)"
 fi
 
-# --- Apply Firefox policies ---
+# --- Setup (password + config) ---
 
-info "Applying Firefox content filtering policies..."
-python3 "$KIDSAFE_DIR/kidsafe.py" policies
-ok "Firefox policies applied (CleanBrowsing Family DNS)"
+echo -e "${BLUE}Set a parent dashboard password (min 4 characters):${NC}"
+while true; do
+    printf "  Password: "
+    read -r -s ADMIN_PASS < /dev/tty
+    echo
+    if [ ${#ADMIN_PASS} -ge 4 ]; then
+        break
+    fi
+    warn "Password must be at least 4 characters. Try again."
+done
+
+info "Running setup..."
+sudo -u $CHILD_USER python3 "$KIDSAFE_DIR/kidsafe.py" setup \
+    --child "$CHILD_USER" \
+    --password "$ADMIN_PASS" \
+    --limit 120 \
+    --homepage "https://www.youtube.com/kids"
+ok "Setup complete"
 
 # --- Done ---
 
@@ -180,20 +195,24 @@ echo -e "${GREEN}╔════════════════════
 echo -e "${GREEN}║     Installation Complete!            ║${NC}"
 echo -e "${GREEN}╚══════════════════════════════════════╝${NC}"
 echo
-echo -e "  ${BLUE}Next steps:${NC}"
+echo -e "  KidSafe is installed and configured for ${YELLOW}$CHILD_USER${NC}."
 echo
-echo -e "  1. Run setup wizard (as $CHILD_USER):"
-echo -e "     ${YELLOW}sudo -u $CHILD_USER python3 $KIDSAFE_DIR/kidsafe.py setup${NC}"
+echo -e "  ${BLUE}What happens now:${NC}"
+echo -e "  - Kiosk auto-starts when $CHILD_USER logs in"
+echo -e "  - Firefox opens in fullscreen with content filtering"
+echo -e "  - Daily limit: ${YELLOW}120 minutes${NC} (change in dashboard)"
+echo -e "  - Schedule: ${YELLOW}7:00 AM – 8:00 PM${NC} (change in dashboard)"
 echo
-echo -e "  2. Test the kiosk:"
-echo -e "     ${YELLOW}sudo -u $CHILD_USER python3 $KIDSAFE_DIR/kidsafe.py start${NC}"
-echo
-echo -e "  3. Parent dashboard:"
+echo -e "  ${BLUE}Parent dashboard:${NC}"
 echo -e "     ${YELLOW}http://127.0.0.1:8484${NC}"
 echo
-echo -e "  The kiosk auto-starts when ${YELLOW}$CHILD_USER${NC} logs in."
+echo -e "  ${BLUE}Manual commands:${NC}"
+echo -e "     ${YELLOW}kidsafe start${NC}    — start kiosk"
+echo -e "     ${YELLOW}kidsafe stop${NC}     — stop kiosk"
+echo -e "     ${YELLOW}kidsafe status${NC}   — check status"
+echo -e "     ${YELLOW}kidsafe setup${NC}    — change settings"
 echo
-echo -e "  To uninstall:"
+echo -e "  ${BLUE}To uninstall:${NC}"
 echo -e "     ${YELLOW}sudo bash $KIDSAFE_DIR/uninstall.sh${NC}"
 echo -e "     or: ${YELLOW}curl -fsSL ${REPO_URL}/uninstall.sh | sudo bash${NC}"
 echo

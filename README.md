@@ -34,27 +34,19 @@ For example:
 curl -fsSL https://raw.githubusercontent.com/tonycodes/kidsafe/main/install.sh | sudo bash -s -- emilio
 ```
 
-This will:
+You'll be prompted for a parent dashboard password. That's it — everything else is configured automatically:
 
-1. Download KidSafe to `/usr/local/kidsafe/`
-2. Create a `kidsafe` symlink in `/usr/local/bin/`
-3. Set up LaunchAgents for auto-start on login
-4. Apply Firefox enterprise policies (DNS filtering, locked settings)
+1. Downloads KidSafe to `/usr/local/kidsafe/`
+2. Creates a `kidsafe` symlink in `/usr/local/bin/`
+3. Sets up LaunchAgents for auto-start on login
+4. Applies Firefox enterprise policies (DNS filtering, locked settings)
+5. Configures the kiosk (120 min daily limit, 7am–8pm schedule)
 
-## Setup
-
-After installing, run the setup wizard as the child user to set your admin password and preferences:
+To re-run setup later or change settings interactively:
 
 ```bash
-sudo -u <child_username> python3 /usr/local/kidsafe/kidsafe.py setup
+kidsafe setup
 ```
-
-You'll be prompted for:
-
-- Child's username
-- Admin password (for the parent dashboard)
-- Daily time limit (minutes)
-- Homepage URL
 
 ## Usage
 

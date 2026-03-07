@@ -831,29 +831,60 @@ def run_dashboard(config, kiosk, port=8484):
 # --- CLI ---
 
 def cmd_setup(args):
-    """Interactive setup."""
+    """Interactive setup (or non-interactive with flags)."""
+    # Parse flags for non-interactive mode
+    flags = {}
+    i = 0
+    while i < len(args):
+        if args[i] == "--child" and i + 1 < len(args):
+            flags["child"] = args[i + 1]; i += 2
+        elif args[i] == "--password" and i + 1 < len(args):
+            flags["password"] = args[i + 1]; i += 2
+        elif args[i] == "--limit" and i + 1 < len(args):
+            flags["limit"] = args[i + 1]; i += 2
+        elif args[i] == "--homepage" and i + 1 < len(args):
+            flags["homepage"] = args[i + 1]; i += 2
+        else:
+            i += 1
+
     print("=== KidSafe Setup ===\n")
     config = load_config()
 
-    child_user = input(f"Child's username [{config['child_user']}]: ").strip()
-    if child_user:
-        config["child_user"] = child_user
+    if "child" in flags:
+        config["child_user"] = flags["child"]
+    else:
+        child_user = input(f"Child's username [{config['child_user']}]: ").strip()
+        if child_user:
+            config["child_user"] = child_user
 
-    print("\nSet an admin password for the parent dashboard:")
-    while True:
-        password = input("Password: ").strip()
-        if len(password) >= 4:
-            config["admin_password_hash"] = hash_password(password)
-            break
-        print("Password must be at least 4 characters.")
+    if "password" in flags:
+        if len(flags["password"]) >= 4:
+            config["admin_password_hash"] = hash_password(flags["password"])
+        else:
+            print("Password must be at least 4 characters.")
+            sys.exit(1)
+    else:
+        print("\nSet an admin password for the parent dashboard:")
+        while True:
+            password = input("Password: ").strip()
+            if len(password) >= 4:
+                config["admin_password_hash"] = hash_password(password)
+                break
+            print("Password must be at least 4 characters.")
 
-    limit = input(f"\nDaily time limit in minutes [{config['daily_limit_minutes']}]: ").strip()
-    if limit and limit.isdigit():
-        config["daily_limit_minutes"] = int(limit)
+    if "limit" in flags:
+        config["daily_limit_minutes"] = int(flags["limit"])
+    else:
+        limit = input(f"\nDaily time limit in minutes [{config['daily_limit_minutes']}]: ").strip()
+        if limit and limit.isdigit():
+            config["daily_limit_minutes"] = int(limit)
 
-    homepage = input(f"Homepage URL [{config['homepage']}]: ").strip()
-    if homepage:
-        config["homepage"] = homepage
+    if "homepage" in flags:
+        config["homepage"] = flags["homepage"]
+    else:
+        homepage = input(f"Homepage URL [{config['homepage']}]: ").strip()
+        if homepage:
+            config["homepage"] = homepage
 
     save_config(config)
     init_db()
