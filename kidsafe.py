@@ -360,6 +360,121 @@ def apply_firefox_policies(config):
 
 # --- Firefox Kiosk Manager ---
 
+# --- App Enforcer (kills unauthorized apps) ---
+
+# Apps that are allowed to run (lowercase for case-insensitive matching).
+# Everything else gets force-quit.
+ALLOWED_APPS = {
+    # The browser
+    "firefox",
+    # Essential OS processes that appear as "apps"
+    "finder",
+    "dock",
+    "systemuiserver",
+    "loginwindow",
+    "notificationcenter",
+    "coreservicesuiagent",
+    "usernotificationcenter",
+    "spotlight",              # search UI (can't do much without Safari)
+    "securityagent",          # password prompts
+    "screensaverengine",
+    "airplayuiagent",
+    "wi-fi",
+    "textinputmenuagent",
+    "control center",
+    "notification center",
+    "talagent",               # text input
+    "universalcontrol",
+}
+
+# Process names that should never be killed (background daemons, not GUI apps)
+ALLOWED_PROCESS_NAMES = {
+    "python3", "python", "Python",  # KidSafe itself
+    "kidsafe", "kidsafe.py",
+    "launchd", "WindowServer", "loginwindow",
+    "Dock", "Finder", "SystemUIServer",
+    "cfprefsd", "distnoted", "UserEventAgent",
+    "sharedfilelistd", "trustd", "secd",
+    "coreauthd", "corebrightnessd",
+    "osascript",  # our own notification commands
+}
+
+
+def get_running_apps():
+    """Get list of running GUI application names via AppleScript."""
+    try:
+        result = subprocess.run(
+            ["osascript", "-e",
+             'tell application "System Events" to get name of every application process whose background only is false'],
+            capture_output=True, text=True, timeout=5
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            return [app.strip() for app in result.stdout.strip().split(", ")]
+    except Exception:
+        pass
+    return []
+
+
+def kill_app(app_name):
+    """Force-quit an app by name."""
+    try:
+        subprocess.run(
+            ["osascript", "-e",
+             f'tell application "{app_name}" to quit'],
+            capture_output=True, timeout=3
+        )
+        # If graceful quit didn't work, force kill
+        time.sleep(0.5)
+        subprocess.run(
+            ["pkill", "-f", app_name],
+            capture_output=True, timeout=3
+        )
+    except Exception:
+        pass
+
+
+def enforce_allowed_apps():
+    """Kill any GUI app not in the allowed list. Returns list of killed apps."""
+    killed = []
+    running = get_running_apps()
+    for app in running:
+        if app.lower() not in ALLOWED_APPS:
+            kill_app(app)
+            killed.append(app)
+    return killed
+
+
+class AppEnforcer:
+    """Background thread that continuously kills unauthorized apps."""
+
+    def __init__(self, check_interval=2):
+        self.check_interval = check_interval
+        self.running = False
+        self.thread = None
+
+    def start(self):
+        self.running = True
+        self.thread = threading.Thread(target=self._run, daemon=True)
+        self.thread.start()
+        log("App enforcer started — unauthorized apps will be killed")
+
+    def stop(self):
+        self.running = False
+
+    def _run(self):
+        while self.running:
+            try:
+                killed = enforce_allowed_apps()
+                for app in killed:
+                    log(f"Killed unauthorized app: {app}")
+                    record_event("app_blocked", app)
+            except Exception as e:
+                log(f"Enforcer error: {e}")
+            time.sleep(self.check_interval)
+
+
+# --- Firefox Kiosk Manager ---
+
 class KioskManager:
     """Manages Firefox in kiosk mode with time limits."""
 
@@ -369,6 +484,7 @@ class KioskManager:
         self.session_start = None
         self.running = False
         self.session_seconds = 0
+        self.enforcer = AppEnforcer(check_interval=2)
 
     def is_within_schedule(self):
         """Check if current time is within allowed schedule."""
@@ -467,6 +583,9 @@ class KioskManager:
         log("KidSafe kiosk manager started")
         record_event("kiosk_start")
 
+        # Start the app enforcer — kills any non-whitelisted GUI apps
+        self.enforcer.start()
+
         while self.running:
             try:
                 # Check schedule
@@ -519,6 +638,7 @@ class KioskManager:
                 log(f"Kiosk loop error: {e}")
                 time.sleep(5)
 
+        self.enforcer.stop()
         self.stop_firefox()
         record_event("kiosk_stop")
         log("KidSafe kiosk manager stopped")
