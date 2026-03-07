@@ -1,0 +1,204 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>PayloadContent</key>
+    <array>
+        <!-- Payload 1: Restrict Apps to Firefox Only -->
+        <dict>
+            <key>PayloadType</key>
+            <string>com.apple.applicationaccess.new</string>
+            <key>PayloadVersion</key>
+            <integer>1</integer>
+            <key>PayloadIdentifier</key>
+            <string>com.kidsafe.profile.appaccess</string>
+            <key>PayloadUUID</key>
+            <string>A1B2C3D4-E5F6-7890-ABCD-EF1234567890</string>
+            <key>PayloadDisplayName</key>
+            <string>KidSafe App Restrictions</string>
+            <key>PayloadDescription</key>
+            <string>Restricts app usage to Firefox only</string>
+            <key>PayloadOrganization</key>
+            <string>KidSafe</string>
+            <key>familyControlsEnabled</key>
+            <true/>
+            <key>whiteList</key>
+            <array>
+                <!-- Firefox -->
+                <dict>
+                    <key>bundleID</key>
+                    <string>org.mozilla.firefox</string>
+                    <key>displayName</key>
+                    <string>Firefox</string>
+                    <key>appID</key>
+                    <string>org.mozilla.firefox</string>
+                </dict>
+                <!-- Finder (required for basic OS function) -->
+                <dict>
+                    <key>bundleID</key>
+                    <string>com.apple.finder</string>
+                    <key>displayName</key>
+                    <string>Finder</string>
+                    <key>appID</key>
+                    <string>com.apple.finder</string>
+                </dict>
+                <!-- loginwindow (required for login/logout) -->
+                <dict>
+                    <key>bundleID</key>
+                    <string>com.apple.loginwindow</string>
+                    <key>displayName</key>
+                    <string>Login Window</string>
+                    <key>appID</key>
+                    <string>com.apple.loginwindow</string>
+                </dict>
+                <!-- SystemUIServer (menu bar, volume, wifi, battery) -->
+                <dict>
+                    <key>bundleID</key>
+                    <string>com.apple.systemuiserver</string>
+                    <key>displayName</key>
+                    <string>System UI Server</string>
+                    <key>appID</key>
+                    <string>com.apple.systemuiserver</string>
+                </dict>
+                <!-- Dock -->
+                <dict>
+                    <key>bundleID</key>
+                    <string>com.apple.dock</string>
+                    <key>displayName</key>
+                    <string>Dock</string>
+                    <key>appID</key>
+                    <string>com.apple.dock</string>
+                </dict>
+                <!-- WindowServer (required for display) -->
+                <dict>
+                    <key>bundleID</key>
+                    <string>com.apple.WindowServer</string>
+                    <key>displayName</key>
+                    <string>Window Server</string>
+                    <key>appID</key>
+                    <string>com.apple.WindowServer</string>
+                </dict>
+                <!-- UserNotificationCenter -->
+                <dict>
+                    <key>bundleID</key>
+                    <string>com.apple.UserNotificationCenter</string>
+                    <key>displayName</key>
+                    <string>User Notification Center</string>
+                    <key>appID</key>
+                    <string>com.apple.UserNotificationCenter</string>
+                </dict>
+                <!-- CoreServicesUIAgent (auth dialogs) -->
+                <dict>
+                    <key>bundleID</key>
+                    <string>com.apple.coreservices.uiagent</string>
+                    <key>displayName</key>
+                    <string>CoreServices UI Agent</string>
+                    <key>appID</key>
+                    <string>com.apple.coreservices.uiagent</string>
+                </dict>
+            </array>
+        </dict>
+
+        <!-- Payload 2: Lock Down Dock (Firefox only) -->
+        <dict>
+            <key>PayloadType</key>
+            <string>com.apple.dock</string>
+            <key>PayloadVersion</key>
+            <integer>1</integer>
+            <key>PayloadIdentifier</key>
+            <string>com.kidsafe.profile.dock</string>
+            <key>PayloadUUID</key>
+            <string>B2C3D4E5-F6A7-8901-BCDE-F12345678901</string>
+            <key>PayloadDisplayName</key>
+            <string>KidSafe Dock Configuration</string>
+            <key>PayloadDescription</key>
+            <string>Locks dock to show only Firefox</string>
+            <key>PayloadOrganization</key>
+            <string>KidSafe</string>
+            <key>static-apps</key>
+            <array>
+                <dict>
+                    <key>tile-data</key>
+                    <dict>
+                        <key>file-data</key>
+                        <dict>
+                            <key>_CFURLString</key>
+                            <string>/Applications/Firefox.app</string>
+                            <key>_CFURLStringType</key>
+                            <integer>0</integer>
+                        </dict>
+                        <key>file-label</key>
+                        <string>Firefox</string>
+                        <key>file-type</key>
+                        <integer>41</integer>
+                    </dict>
+                    <key>tile-type</key>
+                    <string>file-tile</string>
+                </dict>
+            </array>
+            <key>static-others</key>
+            <array/>
+            <key>contents-immutable</key>
+            <true/>
+            <key>size-immutable</key>
+            <true/>
+            <key>position-immutable</key>
+            <true/>
+            <key>show-recents</key>
+            <false/>
+            <key>minimize-to-application</key>
+            <true/>
+        </dict>
+
+        <!-- Payload 3: Disable System Preferences panes -->
+        <dict>
+            <key>PayloadType</key>
+            <string>com.apple.systempreferences</string>
+            <key>PayloadVersion</key>
+            <integer>1</integer>
+            <key>PayloadIdentifier</key>
+            <string>com.kidsafe.profile.sysprefs</string>
+            <key>PayloadUUID</key>
+            <string>C3D4E5F6-A7B8-9012-CDEF-123456789012</string>
+            <key>PayloadDisplayName</key>
+            <string>KidSafe System Preferences Lock</string>
+            <key>PayloadDescription</key>
+            <string>Hides sensitive system preference panes</string>
+            <key>PayloadOrganization</key>
+            <string>KidSafe</string>
+            <key>HiddenPreferencePanes</key>
+            <array>
+                <string>com.apple.preferences.users</string>
+                <string>com.apple.preferences.sharing</string>
+                <string>com.apple.preference.network</string>
+                <string>com.apple.preference.security</string>
+                <string>com.apple.preferences.softwareupdate</string>
+                <string>com.apple.preference.startupdisk</string>
+                <string>com.apple.preference.datetime</string>
+                <string>com.apple.prefs.backup</string>
+                <string>com.apple.preference.general</string>
+            </array>
+        </dict>
+    </array>
+
+    <!-- Profile metadata -->
+    <key>PayloadDisplayName</key>
+    <string>KidSafe - Emilio Restrictions</string>
+    <key>PayloadDescription</key>
+    <string>Restricts this Mac account to Firefox browser only. Locks Dock, hides System Preferences, and prevents access to Terminal and other apps.</string>
+    <key>PayloadIdentifier</key>
+    <string>com.kidsafe.profile</string>
+    <key>PayloadOrganization</key>
+    <string>KidSafe</string>
+    <key>PayloadRemovalDisallowed</key>
+    <true/>
+    <key>PayloadScope</key>
+    <string>User</string>
+    <key>PayloadType</key>
+    <string>Configuration</string>
+    <key>PayloadUUID</key>
+    <string>E5F6A7B8-C9D0-1234-EFAB-345678901234</string>
+    <key>PayloadVersion</key>
+    <integer>1</integer>
+</dict>
+</plist>
