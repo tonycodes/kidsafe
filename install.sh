@@ -68,6 +68,15 @@ fi
 info "Installing for child user: ${YELLOW}${CHILD_USER}${NC}"
 echo
 
+# --- Stop old version if running ---
+
+if pgrep -f "kidsafe.py start" >/dev/null 2>&1; then
+    info "Stopping old KidSafe instance..."
+    pkill -f "kidsafe.py start" 2>/dev/null || true
+    sleep 1
+    ok "Old instance stopped"
+fi
+
 # --- Download files ---
 
 info "Downloading KidSafe..."
@@ -245,6 +254,19 @@ chown -R $CHILD_USER:staff "$CHILD_HOME/.kidsafe"
 # Apply Firefox policies (needs root for /Applications/Firefox.app)
 python3 "$KIDSAFE_DIR/kidsafe.py" policies
 ok "Setup complete"
+
+# --- Start kidsafe ---
+
+info "Starting KidSafe..."
+sudo -u $CHILD_USER nohup python3 "$KIDSAFE_DIR/kidsafe.py" start \
+    >> "$CHILD_HOME/.kidsafe/stdout.log" \
+    2>> "$CHILD_HOME/.kidsafe/stderr.log" &
+sleep 2
+if pgrep -f "kidsafe.py start" >/dev/null 2>&1; then
+    ok "KidSafe is running"
+else
+    warn "KidSafe did not start — check logs at $CHILD_HOME/.kidsafe/stderr.log"
+fi
 
 # --- Done ---
 
