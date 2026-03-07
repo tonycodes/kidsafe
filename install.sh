@@ -181,11 +181,15 @@ while true; do
 done
 
 info "Running setup..."
-sudo -u $CHILD_USER python3 "$KIDSAFE_DIR/kidsafe.py" setup \
+# Pass password via env var to avoid shell escaping issues with special characters
+export KIDSAFE_SETUP_PASS="$ADMIN_PASS"
+sudo -u $CHILD_USER --preserve-env=KIDSAFE_SETUP_PASS \
+    python3 "$KIDSAFE_DIR/kidsafe.py" setup \
     --child "$CHILD_USER" \
-    --password "$ADMIN_PASS" \
+    --password-env KIDSAFE_SETUP_PASS \
     --limit 120 \
     --homepage "https://www.youtube.com/kids"
+unset KIDSAFE_SETUP_PASS
 ok "Setup complete"
 
 # --- Done ---

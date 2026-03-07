@@ -840,6 +840,8 @@ def cmd_setup(args):
             flags["child"] = args[i + 1]; i += 2
         elif args[i] == "--password" and i + 1 < len(args):
             flags["password"] = args[i + 1]; i += 2
+        elif args[i] == "--password-env" and i + 1 < len(args):
+            flags["password"] = os.environ.get(args[i + 1], ""); i += 2
         elif args[i] == "--limit" and i + 1 < len(args):
             flags["limit"] = args[i + 1]; i += 2
         elif args[i] == "--homepage" and i + 1 < len(args):
