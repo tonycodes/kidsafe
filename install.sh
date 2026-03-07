@@ -1,13 +1,13 @@
 #!/bin/bash
 # KidSafe installer for macOS
-# Usage: curl -fsSL https://raw.githubusercontent.com/tonywritescode/kidsafe/main/install.sh | sudo bash -s -- [child_username]
+# Usage: curl -fsSL https://raw.githubusercontent.com/tonycodes/kidsafe/main/install.sh | sudo bash -s -- [child_username]
 #    or: sudo bash install.sh [child_username]
 
 set -e
 
 KIDSAFE_VERSION="1.0.0"
 KIDSAFE_DIR="/usr/local/kidsafe"
-REPO_URL="https://raw.githubusercontent.com/tonywritescode/kidsafe/main"
+REPO_URL="https://raw.githubusercontent.com/tonycodes/kidsafe/main"
 CHILD_USER="${1:-emilio}"
 
 # Colors

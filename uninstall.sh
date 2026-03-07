@@ -1,6 +1,6 @@
 #!/bin/bash
 # KidSafe uninstaller for macOS
-# Usage: curl -fsSL https://raw.githubusercontent.com/tonywritescode/kidsafe/main/uninstall.sh | sudo bash
+# Usage: curl -fsSL https://raw.githubusercontent.com/tonycodes/kidsafe/main/uninstall.sh | sudo bash
 #    or: sudo bash uninstall.sh
 
 set -e
