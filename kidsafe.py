@@ -86,7 +86,8 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "enabled": False,
         "bind_address": "0.0.0.0",
         "allowed_ips": []
-    }
+    },
+    "weekly_schedule": None
 }
 
 
@@ -229,6 +230,92 @@ def save_config(config: Dict[str, Any]) -> None:
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
     with open(CONFIG_FILE, "w") as f:
         json.dump(config, f, indent=2)
+
+
+DAY_KEYS: List[str] = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"]
+
+
+def get_today_day_key() -> str:
+    """Return today's day key (mon-sun)."""
+    return DAY_KEYS[datetime.now().weekday()]
+
+
+def get_today_schedule(config: Dict[str, Any]) -> Dict[str, Any]:
+    """Get today's schedule entry from weekly_schedule, or build from flat config.
+
+    Returns dict with 'limit_minutes' and 'windows' (list of {start, end}).
+    Falls back to flat daily_limit_minutes + schedule when weekly_schedule is
+    not configured or has no entry for today.
+    """
+    ws = config.get("weekly_schedule")
+    if ws:
+        day_key = get_today_day_key()
+        entry = ws.get(day_key)
+        if entry:
+            return {
+                "limit_minutes": entry.get("limit_minutes", config["daily_limit_minutes"]),
+                "windows": entry.get("windows", []),
+            }
+    # Fallback to flat config
+    sched = config.get("schedule", {})
+    windows: List[Dict[str, str]] = []
+    if sched.get("enabled", True):
+        windows = [{"start": sched.get("allowed_start", "07:00"),
+                     "end": sched.get("allowed_end", "20:00")}]
+    return {
+        "limit_minutes": config["daily_limit_minutes"],
+        "windows": windows,
+    }
+
+
+def is_time_in_windows(windows: List[Dict[str, str]]) -> bool:
+    """Check if the current time falls within any of the given windows.
+
+    An empty windows list means no schedule restrictions (always allowed).
+    """
+    if not windows:
+        return True
+    now = datetime.now().strftime("%H:%M")
+    for w in windows:
+        if w["start"] <= now <= w["end"]:
+            return True
+    return False
+
+
+def validate_weekly_schedule(ws: Any) -> Optional[str]:
+    """Validate a weekly_schedule structure. Returns error message or None."""
+    if ws is None:
+        return None
+    if not isinstance(ws, dict):
+        return "weekly_schedule must be an object"
+    valid_days = set(DAY_KEYS)
+    for day, entry in ws.items():
+        if day not in valid_days:
+            return f"Invalid day key: {day}. Must be one of {DAY_KEYS}"
+        if not isinstance(entry, dict):
+            return f"{day}: entry must be an object"
+        if "limit_minutes" in entry:
+            lm = entry["limit_minutes"]
+            if not isinstance(lm, (int, float)) or lm < 0 or lm > 1440:
+                return f"{day}: limit_minutes must be 0-1440"
+        if "windows" in entry:
+            wins = entry["windows"]
+            if not isinstance(wins, list):
+                return f"{day}: windows must be an array"
+            if len(wins) > 4:
+                return f"{day}: maximum 4 windows per day"
+            for i, w in enumerate(wins):
+                if not isinstance(w, dict):
+                    return f"{day}: window {i} must be an object"
+                if "start" not in w or "end" not in w:
+                    return f"{day}: window {i} must have start and end"
+                if not re.match(r"^\d{2}:\d{2}$", w["start"]):
+                    return f"{day}: window {i} start must be HH:MM"
+                if not re.match(r"^\d{2}:\d{2}$", w["end"]):
+                    return f"{day}: window {i} end must be HH:MM"
+                if w["start"] >= w["end"]:
+                    return f"{day}: window {i} start must be before end"
+    return None
 
 
 def hash_password(password: str) -> str:
@@ -534,18 +621,22 @@ class KioskManager:
         self.enforcer: AppEnforcer = AppEnforcer(check_interval=2)
 
     def is_within_schedule(self) -> bool:
-        """Check if current time is within allowed schedule."""
-        if not self.config["schedule"]["enabled"]:
-            return True
-        now = datetime.now().strftime("%H:%M")
-        start: str = self.config["schedule"]["allowed_start"]
-        end: str = self.config["schedule"]["allowed_end"]
-        return start <= now <= end
+        """Check if current time is within allowed schedule windows.
+
+        Uses weekly_schedule for today if configured, otherwise falls back
+        to the flat schedule config.
+        """
+        today = get_today_schedule(self.config)
+        return is_time_in_windows(today["windows"])
+
+    def get_today_limit_minutes(self) -> int:
+        """Get today's daily limit in minutes (from weekly or flat config)."""
+        return get_today_schedule(self.config)["limit_minutes"]
 
     def get_remaining_minutes(self) -> int:
         """Get remaining minutes for today."""
         used = get_today_usage()
-        limit: int = self.config["daily_limit_minutes"] * 60
+        limit: int = self.get_today_limit_minutes() * 60
         remaining = max(0, limit - used)
         return remaining // 60
 
@@ -646,13 +737,18 @@ class KioskManager:
             pass
 
     def show_outside_schedule_screen(self) -> None:
-        """Show an 'Outside Schedule' dialog."""
-        start = self.config["schedule"]["allowed_start"]
-        end = self.config["schedule"]["allowed_end"]
+        """Show an 'Outside Schedule' dialog with today's windows."""
+        today = get_today_schedule(self.config)
+        windows = today["windows"]
+        if windows:
+            parts = [f"{w['start']}-{w['end']}" for w in windows]
+            time_str = ", ".join(parts)
+        else:
+            time_str = "No time scheduled"
         try:
             subprocess.run([
                 "osascript", "-e",
-                f'display dialog "Computer time is between {start} and {end}." '
+                f'display dialog "Computer time is: {time_str}." '
                 'buttons {"OK"} default button "OK" '
                 'with title "KidSafe" with icon caution'
             ], timeout=30, capture_output=True)
@@ -681,7 +777,7 @@ class KioskManager:
 
                 # Check time limit
                 today_usage = get_today_usage()
-                limit_seconds = self.config["daily_limit_minutes"] * 60
+                limit_seconds = self.get_today_limit_minutes() * 60
 
                 if today_usage >= limit_seconds:
                     if self.is_firefox_running():
@@ -942,6 +1038,50 @@ DASHBOARD_HTML: str = """<!DOCTYPE html>
   /* Empty state */
   .empty { text-align: center; padding: 40px 20px; color: var(--gray-text); font-size: 14px; }
 
+  /* Weekly Schedule Grid */
+  .ws-toggle { display: flex; align-items: center; gap: 10px; margin-bottom: 16px; }
+  .ws-toggle label { margin: 0; font-weight: 400; }
+  .ws-switch { position: relative; display: inline-block; width: 44px; height: 24px; flex-shrink: 0; }
+  .ws-switch input { opacity: 0; width: 0; height: 0; }
+  .ws-slider {
+    position: absolute; cursor: pointer; top: 0; left: 0; right: 0; bottom: 0;
+    background: var(--gray-200); border-radius: 24px; transition: 0.3s;
+  }
+  .ws-slider:before {
+    content: ""; position: absolute; height: 18px; width: 18px; left: 3px; bottom: 3px;
+    background: white; border-radius: 50%; transition: 0.3s;
+  }
+  .ws-switch input:checked + .ws-slider { background: var(--blue); }
+  .ws-switch input:checked + .ws-slider:before { transform: translateX(20px); }
+  .ws-day-card {
+    border: 1px solid var(--gray-100); border-radius: var(--radius-sm);
+    padding: 12px; margin-bottom: 10px;
+  }
+  .ws-day-card.today { border-color: var(--blue); background: #f0f7ff; }
+  .ws-day-header {
+    display: flex; align-items: center; justify-content: space-between;
+    margin-bottom: 8px;
+  }
+  .ws-day-name { font-weight: 600; font-size: 14px; text-transform: capitalize; }
+  .ws-day-name .today-badge {
+    font-size: 11px; font-weight: 500; background: var(--blue); color: white;
+    padding: 1px 6px; border-radius: 10px; margin-left: 6px;
+  }
+  .ws-limit-input { width: 70px; padding: 6px 8px; font-size: 14px; text-align: center; }
+  .ws-window-row { display: flex; align-items: center; gap: 6px; margin-top: 6px; }
+  .ws-window-row input[type="time"] { width: 110px; padding: 6px 8px; font-size: 13px; }
+  .ws-window-row span { font-size: 13px; color: var(--gray-text); }
+  .ws-add-btn, .ws-rm-btn {
+    border: none; border-radius: 4px; cursor: pointer; font-size: 13px;
+    padding: 4px 8px; transition: background 0.2s;
+  }
+  .ws-add-btn { background: var(--gray-100); color: var(--gray-dark); margin-top: 6px; }
+  .ws-add-btn:hover { background: var(--gray-200); }
+  .ws-rm-btn { background: none; color: var(--red); font-weight: 700; font-size: 16px; line-height: 1; padding: 2px 6px; }
+  .ws-rm-btn:hover { background: #fee; }
+  .ws-copy-row { display: flex; gap: 8px; align-items: center; margin-bottom: 12px; font-size: 13px; }
+  .ws-copy-row select { padding: 6px 8px; border: 1.5px solid var(--gray-200); border-radius: 6px; font-size: 13px; }
+
   /* --- Responsive --- */
   @media (max-width: 600px) {
     .header-inner { flex-wrap: wrap; }
@@ -1040,6 +1180,110 @@ function switchTab(tab) {
   document.querySelectorAll('.tab-content').forEach(c => c.classList.toggle('active', c.id === 'tab-' + tab));
 }
 
+/* --- Weekly Schedule Helpers --- */
+const DAYS = ['mon','tue','wed','thu','fri','sat','sun'];
+const DAY_LABELS = {mon:'Monday',tue:'Tuesday',wed:'Wednesday',thu:'Thursday',fri:'Friday',sat:'Saturday',sun:'Sunday'};
+
+function getWSEntry(config, day) {
+  if (config.weekly_schedule && config.weekly_schedule[day]) return config.weekly_schedule[day];
+  return { limit_minutes: config.daily_limit_minutes, windows: config.schedule.enabled !== false ? [{start: config.schedule.allowed_start, end: config.schedule.allowed_end}] : [] };
+}
+
+function renderWeeklyEditor(config) {
+  const todayDay = (cachedData.status && cachedData.status.day_of_week) || '';
+  return DAYS.map(day => {
+    const e = getWSEntry(config, day);
+    const isToday = day === todayDay;
+    const windowsHtml = (e.windows || []).map((w, i) =>
+      '<div class="ws-window-row">' +
+        '<input type="time" class="ws-win-start" data-day="'+day+'" data-idx="'+i+'" value="'+w.start+'">' +
+        '<span>to</span>' +
+        '<input type="time" class="ws-win-end" data-day="'+day+'" data-idx="'+i+'" value="'+w.end+'">' +
+        (e.windows.length > 1 ? '<button class="ws-rm-btn" onclick="removeWindow(\\''+day+'\\','+i+')">&times;</button>' : '') +
+      '</div>'
+    ).join('');
+    const canAdd = (e.windows || []).length < 4;
+    return '<div class="ws-day-card'+(isToday?' today':'')+'" data-day="'+day+'">' +
+      '<div class="ws-day-header">' +
+        '<span class="ws-day-name">'+DAY_LABELS[day]+(isToday?'<span class=\\'today-badge\\'>Today</span>':'')+'</span>' +
+        '<div style="display:flex;align-items:center;gap:6px"><label style="font-size:13px;margin:0">Limit:</label><input type="number" class="ws-limit-input" data-day="'+day+'" value="'+e.limit_minutes+'" min="0" max="1440"> min</div>' +
+      '</div>' +
+      windowsHtml +
+      (canAdd ? '<button class="ws-add-btn" onclick="addWindow(\\''+day+'\\')">+ Add window</button>' : '') +
+    '</div>';
+  }).join('');
+}
+
+function toggleWeeklySchedule() {
+  const enabled = document.getElementById('ws_enabled').checked;
+  document.getElementById('ws_editor').style.display = enabled ? '' : 'none';
+  if (!enabled) {
+    api('/config', 'POST', { weekly_schedule: null }).then(() => { toast('Weekly schedule disabled'); render(); });
+  }
+}
+
+function collectWeeklySchedule() {
+  const ws = {};
+  DAYS.forEach(day => {
+    const limitInput = document.querySelector('.ws-limit-input[data-day="'+day+'"]');
+    const startInputs = document.querySelectorAll('.ws-win-start[data-day="'+day+'"]');
+    const endInputs = document.querySelectorAll('.ws-win-end[data-day="'+day+'"]');
+    const windows = [];
+    startInputs.forEach((s, i) => {
+      const e = endInputs[i];
+      if (s.value && e.value) windows.push({start: s.value, end: e.value});
+    });
+    ws[day] = { limit_minutes: parseInt(limitInput.value) || 0, windows };
+  });
+  return ws;
+}
+
+async function saveWeeklySchedule() {
+  const ws = collectWeeklySchedule();
+  const r = await api('/config', 'POST', { weekly_schedule: ws });
+  if (r.ok) { toast('Weekly schedule saved'); render(); }
+  else toast(r.error || 'Validation error', 'error');
+}
+
+function addWindow(day) {
+  const cfg = cachedData.config;
+  if (!cfg.weekly_schedule) cfg.weekly_schedule = {};
+  const e = getWSEntry(cfg, day);
+  if (e.windows.length >= 4) return;
+  e.windows.push({start: '12:00', end: '13:00'});
+  cfg.weekly_schedule[day] = e;
+  render();
+}
+
+function removeWindow(day, idx) {
+  const cfg = cachedData.config;
+  if (!cfg.weekly_schedule) cfg.weekly_schedule = {};
+  const e = getWSEntry(cfg, day);
+  if (e.windows.length <= 1) return;
+  e.windows.splice(idx, 1);
+  cfg.weekly_schedule[day] = e;
+  render();
+}
+
+function copyDaySchedule() {
+  const src = document.getElementById('ws_copy_source').value;
+  const target = document.getElementById('ws_copy_target').value;
+  const srcEntry = { limit_minutes: parseInt(document.querySelector('.ws-limit-input[data-day="'+src+'"]').value) || 0, windows: [] };
+  document.querySelectorAll('.ws-win-start[data-day="'+src+'"]').forEach((s, i) => {
+    const e = document.querySelector('.ws-win-end[data-day="'+src+'"][data-idx="'+i+'"]');
+    if (s.value && e.value) srcEntry.windows.push({start: s.value, end: e.value});
+  });
+  let targetDays = [];
+  if (target === 'weekdays') targetDays = ['mon','tue','wed','thu','fri'];
+  else if (target === 'weekend') targetDays = ['sat','sun'];
+  else targetDays = DAYS.slice();
+  const cfg = cachedData.config;
+  if (!cfg.weekly_schedule) cfg.weekly_schedule = {};
+  targetDays.forEach(d => { cfg.weekly_schedule[d] = JSON.parse(JSON.stringify(srcEntry)); });
+  toast('Copied ' + src + ' to ' + target);
+  render();
+}
+
 /* --- Status Helpers --- */
 function getStatusInfo(status) {
   if (!status.firefox_running && !status.within_schedule) return { cls: 'outside', label: 'Outside Schedule' };
@@ -1060,7 +1304,8 @@ async function render() {
   }
   cachedData = { status, config, history, events };
   const si = getStatusInfo(status);
-  const usedPct = Math.min(100, (status.used_minutes / config.daily_limit_minutes) * 100);
+  const todayLimit = status.limit_minutes || config.daily_limit_minutes;
+  const usedPct = Math.min(100, (status.used_minutes / todayLimit) * 100);
   const barClass = usedPct > 90 ? 'danger' : usedPct > 70 ? 'warning' : '';
   const maxMin = (history || []).reduce((m, h) => Math.max(m, h.minutes), 1);
   const avgMin = (history || []).length ? Math.round((history || []).reduce((s, h) => s + h.minutes, 0) / history.length) : 0;
@@ -1096,7 +1341,7 @@ async function render() {
             <div class="stat"><div class="stat-value">${status.used_minutes}</div><div class="stat-label">Used Today</div></div>
             <div class="stat"><div class="stat-value">${status.firefox_running ? 'ON' : 'OFF'}</div><div class="stat-label">Firefox</div></div>
           </div>
-          <div class="bar-label"><span>${status.used_minutes} of ${config.daily_limit_minutes} min</span><span>${Math.round(usedPct)}%</span></div>
+          <div class="bar-label"><span>${status.used_minutes} of ${todayLimit} min${status.day_of_week ? ' ('+status.day_of_week+')' : ''}</span><span>${Math.round(usedPct)}%</span></div>
           <div class="bar"><div class="bar-fill ${barClass}" style="width:${usedPct}%"></div></div>
         </div>
         <div class="card">
@@ -1144,7 +1389,7 @@ async function render() {
           <div class="trend-grid">
             <div class="trend-card"><div class="trend-value" style="color:var(--blue)">${avgMin}</div><div class="trend-label">Avg Min / Day</div></div>
             <div class="trend-card"><div class="trend-value" style="color:var(--green)">${totalWeek}</div><div class="trend-label">Total This Week</div></div>
-            <div class="trend-card"><div class="trend-value" style="color:var(--orange)">${config.daily_limit_minutes}</div><div class="trend-label">Daily Limit</div></div>
+            <div class="trend-card"><div class="trend-value" style="color:var(--orange)">${todayLimit}</div><div class="trend-label">Today's Limit</div></div>
             <div class="trend-card"><div class="trend-value" style="color:${usedPct > 90 ? 'var(--red)' : 'var(--blue)'}">${Math.round(usedPct)}%</div><div class="trend-label">Used Today</div></div>
           </div>
         </div>
@@ -1163,15 +1408,33 @@ async function render() {
           </div>
         </div>
         <div class="card">
-          <div class="card-title">Schedule</div>
+          <div class="card-title">Schedule (Default)</div>
           <div class="form-group">
-            <label>Allowed hours</label>
+            <label>Allowed hours (used when weekly schedule is off)</label>
             <div class="form-row">
               <input type="time" id="sched_start" value="${config.schedule.allowed_start}">
               <span>to</span>
               <input type="time" id="sched_end" value="${config.schedule.allowed_end}">
               <button class="save-btn" onclick="saveSchedule()">Save</button>
             </div>
+          </div>
+        </div>
+        <div class="card">
+          <div class="card-title">Weekly Schedule</div>
+          <div class="ws-toggle">
+            <label class="ws-switch"><input type="checkbox" id="ws_enabled" ${config.weekly_schedule ? 'checked' : ''} onchange="toggleWeeklySchedule()"><span class="ws-slider"></span></label>
+            <label>Use per-day limits and time windows</label>
+          </div>
+          <div id="ws_editor" style="${config.weekly_schedule ? '' : 'display:none'}">
+            <div class="ws-copy-row">
+              <span>Copy settings from</span>
+              <select id="ws_copy_source">${['mon','tue','wed','thu','fri','sat','sun'].map(d => '<option value="'+d+'">'+d+'</option>').join('')}</select>
+              <span>to</span>
+              <select id="ws_copy_target"><option value="weekdays">Weekdays</option><option value="weekend">Weekend</option><option value="all">All days</option></select>
+              <button class="save-btn" onclick="copyDaySchedule()" style="padding:6px 12px;font-size:13px">Copy</button>
+            </div>
+            ${renderWeeklyEditor(config)}
+            <button class="save-btn" onclick="saveWeeklySchedule()" style="margin-top:8px">Save Weekly Schedule</button>
           </div>
         </div>
         <div class="card">
@@ -1331,11 +1594,14 @@ class DashboardHandler(BaseHTTPRequestHandler):
         assert DashboardHandler.config is not None
         if self.path == "/api/status":
             used = get_today_usage()
-            limit = DashboardHandler.config["daily_limit_minutes"] * 60
+            today = get_today_schedule(DashboardHandler.config)
+            limit = today["limit_minutes"] * 60
             self.send_json({
                 "used_minutes": used // 60,
                 "remaining_minutes": max(0, (limit - used)) // 60,
-                "limit_minutes": DashboardHandler.config["daily_limit_minutes"],
+                "limit_minutes": today["limit_minutes"],
+                "today_windows": today["windows"],
+                "day_of_week": get_today_day_key(),
                 "firefox_running": DashboardHandler.kiosk.is_firefox_running() if DashboardHandler.kiosk else False,
                 "within_schedule": DashboardHandler.kiosk.is_within_schedule() if DashboardHandler.kiosk else True
             })
@@ -1383,6 +1649,11 @@ class DashboardHandler(BaseHTTPRequestHandler):
             return
 
         if self.path == "/api/config":
+            if "weekly_schedule" in body:
+                err = validate_weekly_schedule(body["weekly_schedule"])
+                if err:
+                    self.send_json({"ok": False, "error": err}, 400)
+                    return
             DashboardHandler.config.update(body)
             save_config(DashboardHandler.config)
             record_event("config_update", json.dumps(body))
@@ -1588,14 +1859,18 @@ def cmd_status(args: List[str]) -> None:
     """Show current status."""
     config = load_config()
     used = get_today_usage()
-    limit = config["daily_limit_minutes"] * 60
+    today = get_today_schedule(config)
+    limit = today["limit_minutes"] * 60
     remaining = max(0, (limit - used)) // 60
 
     print(f"Child user:    {config['child_user']}")
-    print(f"Today's usage: {used // 60} minutes")
-    print(f"Remaining:     {remaining} minutes")
-    print(f"Daily limit:   {config['daily_limit_minutes']} minutes")
-    print(f"Schedule:      {config['schedule']['allowed_start']} - {config['schedule']['allowed_end']}")
+    print(f"Today ({get_today_day_key()}):  {used // 60} min used, {remaining} min left")
+    print(f"Daily limit:   {today['limit_minutes']} minutes")
+    if today["windows"]:
+        windows_str = ", ".join(f"{w['start']}-{w['end']}" for w in today["windows"])
+        print(f"Schedule:      {windows_str}")
+    else:
+        print("Schedule:      No restrictions")
     remote_cfg = config.get("remote_access", {})
     if remote_cfg.get("enabled", False):
         local_ip = get_local_ip()
