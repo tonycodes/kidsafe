@@ -13,6 +13,8 @@ Locks a macOS user account to Firefox-only browsing with:
 Designed for macOS 11+ (Big Sur), Python 3.8+, zero dependencies.
 """
 
+from __future__ import annotations
+
 import json
 import os
 import signal
@@ -26,16 +28,18 @@ import secrets
 from datetime import datetime, timedelta
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
+from types import FrameType
+from typing import Any, Callable, Dict, List, Optional, Set
 from urllib.parse import parse_qs, urlparse
 
 # --- Configuration ---
 
-CONFIG_DIR = Path.home() / ".kidsafe"
-CONFIG_FILE = CONFIG_DIR / "config.json"
-DB_FILE = CONFIG_DIR / "activity.db"
-LOG_FILE = CONFIG_DIR / "kidsafe.log"
+CONFIG_DIR: Path = Path.home() / ".kidsafe"
+CONFIG_FILE: Path = CONFIG_DIR / "config.json"
+DB_FILE: Path = CONFIG_DIR / "activity.db"
+LOG_FILE: Path = CONFIG_DIR / "kidsafe.log"
 
-DEFAULT_CONFIG = {
+DEFAULT_CONFIG: Dict[str, Any] = {
     "child_user": "emilio",
     "admin_password_hash": "",
     "admin_port": 8484,
@@ -78,7 +82,7 @@ DEFAULT_CONFIG = {
 }
 
 
-def log(msg):
+def log(msg: str) -> None:
     """Simple logging to file and stdout."""
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     line = f"[{timestamp}] {msg}"
@@ -92,7 +96,7 @@ def log(msg):
 
 # --- Database ---
 
-def init_db():
+def init_db() -> None:
     """Initialize SQLite database for activity tracking."""
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(str(DB_FILE))
@@ -122,7 +126,7 @@ def init_db():
     conn.close()
 
 
-def record_event(event_type, detail=""):
+def record_event(event_type: str, detail: str = "") -> None:
     """Record an event to the database."""
     try:
         conn = sqlite3.connect(str(DB_FILE))
@@ -136,7 +140,7 @@ def record_event(event_type, detail=""):
         log(f"DB error: {e}")
 
 
-def get_today_usage():
+def get_today_usage() -> int:
     """Get total usage seconds for today."""
     try:
         conn = sqlite3.connect(str(DB_FILE))
@@ -150,7 +154,7 @@ def get_today_usage():
         return 0
 
 
-def update_daily_usage(seconds):
+def update_daily_usage(seconds: int) -> None:
     """Update today's usage total."""
     try:
         conn = sqlite3.connect(str(DB_FILE))
@@ -165,7 +169,7 @@ def update_daily_usage(seconds):
         log(f"DB error: {e}")
 
 
-def get_usage_history(days=7):
+def get_usage_history(days: int = 7) -> List[Dict[str, Any]]:
     """Get usage history for the last N days."""
     try:
         conn = sqlite3.connect(str(DB_FILE))
@@ -180,7 +184,7 @@ def get_usage_history(days=7):
         return []
 
 
-def get_recent_events(limit=50):
+def get_recent_events(limit: int = 50) -> List[Dict[str, Any]]:
     """Get recent events."""
     try:
         conn = sqlite3.connect(str(DB_FILE))
@@ -196,12 +200,12 @@ def get_recent_events(limit=50):
 
 # --- Config ---
 
-def load_config():
+def load_config() -> Dict[str, Any]:
     """Load config from file, creating defaults if needed."""
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
     if CONFIG_FILE.exists():
         with open(CONFIG_FILE) as f:
-            config = json.load(f)
+            config: Dict[str, Any] = json.load(f)
         # Merge any new default keys
         for key, val in DEFAULT_CONFIG.items():
             if key not in config:
@@ -212,21 +216,21 @@ def load_config():
         return DEFAULT_CONFIG.copy()
 
 
-def save_config(config):
+def save_config(config: Dict[str, Any]) -> None:
     """Save config to file."""
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
     with open(CONFIG_FILE, "w") as f:
         json.dump(config, f, indent=2)
 
 
-def hash_password(password):
+def hash_password(password: str) -> str:
     """Hash a password with a salt."""
     salt = secrets.token_hex(16)
     hashed = hashlib.sha256((salt + password).encode()).hexdigest()
     return f"{salt}:{hashed}"
 
 
-def verify_password(password, stored):
+def verify_password(password: str, stored: Optional[str]) -> bool:
     """Verify a password against stored hash."""
     if not stored:
         return False
@@ -236,18 +240,18 @@ def verify_password(password, stored):
 
 # --- Firefox Policy Management ---
 
-FIREFOX_POLICY_DIR = Path("/Applications/Firefox.app/Contents/Resources/distribution")
-FIREFOX_POLICY_FILE = FIREFOX_POLICY_DIR / "policies.json"
+FIREFOX_POLICY_DIR: Path = Path("/Applications/Firefox.app/Contents/Resources/distribution")
+FIREFOX_POLICY_FILE: Path = FIREFOX_POLICY_DIR / "policies.json"
 
 
-def generate_firefox_policies(config):
+def generate_firefox_policies(config: Dict[str, Any]) -> Dict[str, Any]:
     """Generate Firefox enterprise policies for content filtering."""
     dns_url = config["dns_providers"].get(
         config["dns_provider"],
         config["dns_providers"]["cleanbrowsing"]
     )
 
-    policies = {
+    policies: Dict[str, Any] = {
         "policies": {
             # Force DNS-over-HTTPS with family filter
             "DNSOverHTTPS": {
@@ -308,7 +312,7 @@ def generate_firefox_policies(config):
     }
 
     # Add bookmarks for allowed sites
-    toolbar_bookmarks = []
+    toolbar_bookmarks: List[Dict[str, str]] = []
     for site in config["allowed_sites"][:10]:
         name = site.split(".")[0].replace("/", " ").title()
         toolbar_bookmarks.append({
@@ -323,8 +327,8 @@ def generate_firefox_policies(config):
     # Website filter (whitelist mode if allowed_sites is set)
     if config.get("allowed_sites"):
         # Block everything, then allow specific sites
-        web_filter = {"Block": ["*"]}
-        exceptions = [f"*://*.{site}/*" for site in config["allowed_sites"]]
+        web_filter: Dict[str, List[str]] = {"Block": ["*"]}
+        exceptions: List[str] = [f"*://*.{site}/*" for site in config["allowed_sites"]]
         # Also allow the homepage domain
         homepage_domain = urlparse(config["homepage"]).netloc
         if homepage_domain:
@@ -337,13 +341,13 @@ def generate_firefox_policies(config):
     if config.get("blocked_sites"):
         if "WebsiteFilter" not in policies["policies"]:
             policies["policies"]["WebsiteFilter"] = {}
-        block_patterns = [f"*://*.{site}/*" for site in config["blocked_sites"]]
+        block_patterns: List[str] = [f"*://*.{site}/*" for site in config["blocked_sites"]]
         policies["policies"]["WebsiteFilter"]["Block"] = block_patterns
 
     return policies
 
 
-def apply_firefox_policies(config):
+def apply_firefox_policies(config: Dict[str, Any]) -> bool:
     """Write Firefox enterprise policies to disk."""
     policies = generate_firefox_policies(config)
     try:
@@ -367,12 +371,12 @@ import re
 
 # .app bundles that are allowed to run (lowercase). Everything else from
 # /Applications/ or /System/Applications/ gets killed.
-ALLOWED_APP_BUNDLES = {
+ALLOWED_APP_BUNDLES: Set[str] = {
     "firefox.app",
 }
 
 
-def find_unauthorized_apps():
+def find_unauthorized_apps() -> Dict[str, List[int]]:
     """Find running .app processes that aren't in the allowed list.
     Returns dict of {app_name: [pids]} for apps that should be killed.
     No special permissions required — just reads `ps` output."""
@@ -384,7 +388,7 @@ def find_unauthorized_apps():
     except Exception:
         return {}
 
-    apps = {}  # {app_name: [pids]}
+    apps: Dict[str, List[int]] = {}  # {app_name: [pids]}
     for line in result.stdout.strip().split("\n")[1:]:
         parts = line.strip().split(None, 1)
         if len(parts) < 2:
@@ -402,10 +406,10 @@ def find_unauthorized_apps():
     return apps
 
 
-def kill_unauthorized_apps():
+def kill_unauthorized_apps() -> List[str]:
     """Kill all unauthorized .app processes. Returns list of app names killed."""
-    apps = find_unauthorized_apps()
-    killed = []
+    apps: Dict[str, List[int]] = find_unauthorized_apps()
+    killed: List[str] = []
     for app_name, pids in apps.items():
         for pid in pids:
             try:
@@ -419,21 +423,25 @@ def kill_unauthorized_apps():
 class AppEnforcer:
     """Background thread that continuously kills unauthorized apps."""
 
-    def __init__(self, check_interval=2):
+    check_interval: int
+    running: bool
+    thread: Optional[threading.Thread]
+
+    def __init__(self, check_interval: int = 2) -> None:
         self.check_interval = check_interval
         self.running = False
         self.thread = None
 
-    def start(self):
+    def start(self) -> None:
         self.running = True
         self.thread = threading.Thread(target=self._run, daemon=True)
         self.thread.start()
         log("App enforcer started — unauthorized apps will be killed")
 
-    def stop(self):
+    def stop(self) -> None:
         self.running = False
 
-    def _run(self):
+    def _run(self) -> None:
         while self.running:
             try:
                 killed = kill_unauthorized_apps()
@@ -450,7 +458,14 @@ class AppEnforcer:
 class KioskManager:
     """Manages Firefox in kiosk mode with time limits."""
 
-    def __init__(self, config):
+    config: Dict[str, Any]
+    firefox_process: Optional[subprocess.Popen[bytes]]
+    session_start: Optional[datetime]
+    running: bool
+    session_seconds: int
+    enforcer: AppEnforcer
+
+    def __init__(self, config: Dict[str, Any]) -> None:
         self.config = config
         self.firefox_process = None
         self.session_start = None
@@ -458,21 +473,23 @@ class KioskManager:
         self.session_seconds = 0
         self.enforcer = AppEnforcer(check_interval=2)
 
-    def is_within_schedule(self):
+    def is_within_schedule(self) -> bool:
         """Check if current time is within allowed schedule."""
         if not self.config["schedule"]["enabled"]:
             return True
-        now = datetime.now().strftime("%H:%M")
-        return self.config["schedule"]["allowed_start"] <= now <= self.config["schedule"]["allowed_end"]
+        now: str = datetime.now().strftime("%H:%M")
+        start: str = self.config["schedule"]["allowed_start"]
+        end: str = self.config["schedule"]["allowed_end"]
+        return bool(start <= now <= end)
 
-    def get_remaining_minutes(self):
+    def get_remaining_minutes(self) -> int:
         """Get remaining minutes for today."""
-        used = get_today_usage()
-        limit = self.config["daily_limit_minutes"] * 60
-        remaining = max(0, limit - used)
+        used: int = get_today_usage()
+        limit: int = int(self.config["daily_limit_minutes"]) * 60
+        remaining: int = max(0, limit - used)
         return remaining // 60
 
-    def hide_dock(self):
+    def hide_dock(self) -> None:
         """Auto-hide the Dock so the child only sees Firefox."""
         try:
             subprocess.run(
@@ -483,7 +500,7 @@ class KioskManager:
         except Exception:
             pass
 
-    def ensure_firefox_fullscreen(self):
+    def ensure_firefox_fullscreen(self) -> None:
         """Make sure Firefox is in fullscreen. Sends Cmd+Shift+F if not."""
         try:
             # Check if Firefox has a fullscreen window
@@ -503,9 +520,9 @@ class KioskManager:
         except Exception:
             pass
 
-    def launch_firefox(self):
+    def launch_firefox(self) -> bool:
         """Launch Firefox in kiosk mode."""
-        cmd = ["/Applications/Firefox.app/Contents/MacOS/firefox"]
+        cmd: List[str] = ["/Applications/Firefox.app/Contents/MacOS/firefox"]
         if self.config["firefox_kiosk"]:
             cmd.append("--kiosk")
         cmd.append(self.config["homepage"])
@@ -526,7 +543,7 @@ class KioskManager:
             log(f"Failed to launch Firefox: {e}")
             return False
 
-    def stop_firefox(self):
+    def stop_firefox(self) -> None:
         """Stop Firefox gracefully."""
         if self.firefox_process:
             try:
@@ -540,13 +557,13 @@ class KioskManager:
             log("Firefox stopped")
             record_event("firefox_stop")
 
-    def is_firefox_running(self):
+    def is_firefox_running(self) -> bool:
         """Check if Firefox process is still running."""
         if self.firefox_process:
             return self.firefox_process.poll() is None
         return False
 
-    def show_notification(self, title, message):
+    def show_notification(self, title: str, message: str) -> None:
         """Show a macOS notification."""
         try:
             subprocess.run([
@@ -556,7 +573,7 @@ class KioskManager:
         except Exception:
             pass
 
-    def show_times_up_screen(self):
+    def show_times_up_screen(self) -> None:
         """Show a 'Time's Up' dialog."""
         try:
             subprocess.run([
@@ -568,10 +585,10 @@ class KioskManager:
         except Exception:
             pass
 
-    def show_outside_schedule_screen(self):
+    def show_outside_schedule_screen(self) -> None:
         """Show an 'Outside Schedule' dialog."""
-        start = self.config["schedule"]["allowed_start"]
-        end = self.config["schedule"]["allowed_end"]
+        start: str = self.config["schedule"]["allowed_start"]
+        end: str = self.config["schedule"]["allowed_end"]
         try:
             subprocess.run([
                 "osascript", "-e",
@@ -582,7 +599,7 @@ class KioskManager:
         except Exception:
             pass
 
-    def run(self):
+    def run(self) -> None:
         """Main kiosk loop."""
         self.running = True
         log("KidSafe kiosk manager started")
@@ -652,7 +669,7 @@ class KioskManager:
         record_event("kiosk_stop")
         log("KidSafe kiosk manager stopped")
 
-    def stop(self):
+    def stop(self) -> None:
         """Signal the kiosk to stop."""
         self.running = False
 
@@ -857,28 +874,28 @@ setInterval(render, 30000);
 class DashboardHandler(BaseHTTPRequestHandler):
     """HTTP handler for the parent dashboard."""
 
-    server_version = "KidSafe/1.0"
-    config = None
-    kiosk = None
-    auth_tokens = set()
+    server_version: str = "KidSafe/1.0"
+    config: Optional[Dict[str, Any]] = None
+    kiosk: Optional[KioskManager] = None
+    auth_tokens: Set[str] = set()
 
-    def log_message(self, format, *args):
+    def log_message(self, format: str, *args: Any) -> None:
         """Suppress default HTTP logging."""
         pass
 
-    def send_json(self, data, status=200):
+    def send_json(self, data: Any, status: int = 200) -> None:
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
         self.end_headers()
         self.wfile.write(json.dumps(data).encode())
 
-    def check_auth(self):
+    def check_auth(self) -> bool:
         auth = self.headers.get("Authorization", "")
         if auth.startswith("Bearer "):
             return auth[7:] in DashboardHandler.auth_tokens
         return False
 
-    def do_GET(self):
+    def do_GET(self) -> None:
         if self.path == "/" or self.path == "/dashboard":
             self.send_response(200)
             self.send_header("Content-Type", "text/html")
@@ -890,18 +907,21 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self.send_json({"error": "unauthorized"}, 401)
             return
 
+        config = DashboardHandler.config
+        assert config is not None
+
         if self.path == "/api/status":
-            used = get_today_usage()
-            limit = DashboardHandler.config["daily_limit_minutes"] * 60
+            used: int = get_today_usage()
+            limit: int = config["daily_limit_minutes"] * 60
             self.send_json({
                 "used_minutes": used // 60,
                 "remaining_minutes": max(0, (limit - used)) // 60,
-                "limit_minutes": DashboardHandler.config["daily_limit_minutes"],
+                "limit_minutes": config["daily_limit_minutes"],
                 "firefox_running": DashboardHandler.kiosk.is_firefox_running() if DashboardHandler.kiosk else False,
                 "within_schedule": DashboardHandler.kiosk.is_within_schedule() if DashboardHandler.kiosk else True
             })
         elif self.path == "/api/config":
-            safe_config = {k: v for k, v in DashboardHandler.config.items() if k != "admin_password_hash"}
+            safe_config: Dict[str, Any] = {k: v for k, v in config.items() if k != "admin_password_hash"}
             self.send_json(safe_config)
         elif self.path == "/api/history":
             self.send_json(get_usage_history())
@@ -910,14 +930,17 @@ class DashboardHandler(BaseHTTPRequestHandler):
         else:
             self.send_json({"error": "not found"}, 404)
 
-    def do_POST(self):
-        content_length = int(self.headers.get("Content-Length", 0))
-        body = json.loads(self.rfile.read(content_length)) if content_length > 0 else {}
+    def do_POST(self) -> None:
+        content_length: int = int(self.headers.get("Content-Length", 0))
+        body: Dict[str, Any] = json.loads(self.rfile.read(content_length)) if content_length > 0 else {}
+
+        config = DashboardHandler.config
+        assert config is not None
 
         if self.path == "/api/login":
-            password = body.get("password", "")
-            if verify_password(password, DashboardHandler.config.get("admin_password_hash")):
-                token = secrets.token_hex(32)
+            password: str = body.get("password", "")
+            if verify_password(password, config.get("admin_password_hash")):
+                token: str = secrets.token_hex(32)
                 DashboardHandler.auth_tokens.add(token)
                 self.send_json({"token": token})
             else:
@@ -929,8 +952,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
             return
 
         if self.path == "/api/config":
-            DashboardHandler.config.update(body)
-            save_config(DashboardHandler.config)
+            config.update(body)
+            save_config(config)
             record_event("config_update", json.dumps(body))
             self.send_json({"ok": True})
         elif self.path == "/api/reset-time":
@@ -938,7 +961,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
             record_event("time_reset", "Admin reset daily time")
             self.send_json({"ok": True})
         elif self.path == "/api/apply-policies":
-            ok = apply_firefox_policies(DashboardHandler.config)
+            ok: bool = apply_firefox_policies(config)
             self.send_json({"ok": ok, "message": "Policies applied" if ok else "Failed — need admin permissions"})
         elif self.path == "/api/stop-kiosk":
             if DashboardHandler.kiosk:
@@ -948,7 +971,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self.send_json({"error": "not found"}, 404)
 
 
-def run_dashboard(config, kiosk, port=8484):
+def run_dashboard(config: Dict[str, Any], kiosk: KioskManager, port: int = 8484) -> None:
     """Start the parent dashboard web server."""
     DashboardHandler.config = config
     DashboardHandler.kiosk = kiosk
@@ -959,10 +982,10 @@ def run_dashboard(config, kiosk, port=8484):
 
 # --- CLI ---
 
-def cmd_setup(args):
+def cmd_setup(args: List[str]) -> None:
     """Interactive setup (or non-interactive with flags)."""
     # Parse flags for non-interactive mode
-    flags = {}
+    flags: Dict[str, str] = {}
     i = 0
     while i < len(args):
         if args[i] == "--child" and i + 1 < len(args):
@@ -1028,7 +1051,7 @@ def cmd_setup(args):
     print(f"Parent dashboard: http://127.0.0.1:{config['admin_port']}")
 
 
-def cmd_start(args):
+def cmd_start(args: List[str]) -> None:
     """Start the kiosk and dashboard."""
     config = load_config()
     init_db()
@@ -1050,7 +1073,7 @@ def cmd_start(args):
     dashboard_thread.start()
 
     # Handle SIGTERM gracefully
-    def handle_signal(signum, frame):
+    def handle_signal(signum: int, frame: Optional[FrameType]) -> None:
         log("Received shutdown signal")
         kiosk.stop()
 
@@ -1061,7 +1084,7 @@ def cmd_start(args):
     kiosk.run()
 
 
-def cmd_stop(args):
+def cmd_stop(args: List[str]) -> None:
     """Stop the kiosk by finding and killing the process."""
     try:
         result = subprocess.run(
@@ -1079,7 +1102,7 @@ def cmd_stop(args):
         print(f"Error: {e}")
 
 
-def cmd_status(args):
+def cmd_status(args: List[str]) -> None:
     """Show current status."""
     config = load_config()
     used = get_today_usage()
@@ -1094,13 +1117,13 @@ def cmd_status(args):
     print(f"Dashboard:     http://127.0.0.1:{config['admin_port']}")
 
 
-def cmd_reset(args):
+def cmd_reset(args: List[str]) -> None:
     """Reset today's time."""
     update_daily_usage(0)
     print("Today's usage reset to zero.")
 
 
-def cmd_policies(args):
+def cmd_policies(args: List[str]) -> None:
     """Apply Firefox policies."""
     config = load_config()
     if apply_firefox_policies(config):
@@ -1109,7 +1132,7 @@ def cmd_policies(args):
         print("Failed to apply policies. Try with sudo.")
 
 
-def main():
+def main() -> None:
     if len(sys.argv) < 2:
         print("KidSafe - Parental Control Kiosk for macOS")
         print()
@@ -1124,7 +1147,7 @@ def main():
         print("  policies  Apply Firefox policies")
         sys.exit(0)
 
-    commands = {
+    commands: Dict[str, Callable[[List[str]], None]] = {
         "setup": cmd_setup,
         "start": cmd_start,
         "stop": cmd_stop,
@@ -1133,7 +1156,7 @@ def main():
         "policies": cmd_policies,
     }
 
-    cmd = sys.argv[1]
+    cmd: str = sys.argv[1]
     if cmd in commands:
         commands[cmd](sys.argv[2:])
     else:
