@@ -668,55 +668,255 @@ DASHBOARD_HTML: str = """<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="default">
 <title>KidSafe Dashboard</title>
 <style>
-  * { margin: 0; padding: 0; box-sizing: border-box; }
-  body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
-         background: #f5f5f7; color: #1d1d1f; padding: 20px; max-width: 800px; margin: 0 auto; }
-  h1 { font-size: 28px; margin-bottom: 8px; }
-  h2 { font-size: 20px; margin: 24px 0 12px; color: #6e6e73; }
-  .subtitle { color: #6e6e73; margin-bottom: 24px; }
-  .card { background: white; border-radius: 12px; padding: 20px; margin-bottom: 16px;
-          box-shadow: 0 1px 3px rgba(0,0,0,0.1); }
-  .stat { display: inline-block; text-align: center; margin-right: 32px; }
-  .stat-value { font-size: 36px; font-weight: 700; color: #0071e3; }
-  .stat-label { font-size: 13px; color: #6e6e73; margin-top: 4px; }
-  .bar { height: 8px; background: #e5e5ea; border-radius: 4px; margin: 8px 0; }
-  .bar-fill { height: 100%; background: #0071e3; border-radius: 4px; transition: width 0.3s; }
-  .bar-fill.warning { background: #ff9500; }
-  .bar-fill.danger { background: #ff3b30; }
+  *, *::before, *::after { margin: 0; padding: 0; box-sizing: border-box; }
+  :root {
+    --blue: #0071e3; --blue-hover: #0077ed; --green: #34c759; --orange: #ff9500;
+    --red: #ff3b30; --red-hover: #ff453a; --gray-bg: #f5f5f7; --gray-100: #e5e5ea;
+    --gray-200: #d2d2d7; --gray-text: #6e6e73; --gray-dark: #1d1d1f;
+    --card-bg: white; --card-shadow: 0 1px 3px rgba(0,0,0,0.08);
+    --radius: 12px; --radius-sm: 8px;
+    --safe-top: env(safe-area-inset-top, 0px);
+    --safe-bottom: env(safe-area-inset-bottom, 0px);
+  }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif;
+    background: var(--gray-bg); color: var(--gray-dark);
+    line-height: 1.5; -webkit-text-size-adjust: 100%;
+    padding-top: var(--safe-top); padding-bottom: var(--safe-bottom);
+  }
+
+  /* --- Toast --- */
+  .toast-container { position: fixed; top: 16px; right: 16px; z-index: 9999; display: flex; flex-direction: column; gap: 8px; pointer-events: none; }
+  .toast {
+    pointer-events: auto; padding: 12px 20px; border-radius: var(--radius-sm);
+    font-size: 14px; font-weight: 500; color: white; opacity: 0;
+    transform: translateX(40px); transition: all 0.3s ease;
+    box-shadow: 0 4px 12px rgba(0,0,0,0.15); max-width: 340px;
+  }
+  .toast.show { opacity: 1; transform: translateX(0); }
+  .toast.success { background: var(--green); }
+  .toast.error { background: var(--red); }
+  .toast.info { background: var(--blue); }
+
+  /* --- Login --- */
+  .login-wrapper {
+    display: flex; align-items: center; justify-content: center;
+    min-height: 100vh; min-height: 100dvh; padding: 20px;
+  }
+  .login-card {
+    background: var(--card-bg); border-radius: 16px; padding: 40px 32px;
+    box-shadow: 0 4px 24px rgba(0,0,0,0.1); width: 100%; max-width: 380px; text-align: center;
+  }
+  .login-card .logo { font-size: 40px; margin-bottom: 8px; }
+  .login-card h1 { font-size: 24px; margin-bottom: 4px; }
+  .login-card .subtitle { color: var(--gray-text); margin-bottom: 24px; font-size: 15px; }
+  .login-card input {
+    width: 100%; padding: 12px 16px; border: 1.5px solid var(--gray-200);
+    border-radius: var(--radius-sm); font-size: 16px; margin-bottom: 16px;
+    outline: none; transition: border-color 0.2s;
+  }
+  .login-card input:focus { border-color: var(--blue); }
+  .login-card button {
+    width: 100%; padding: 12px; background: var(--blue); color: white;
+    border: none; border-radius: var(--radius-sm); font-size: 16px;
+    font-weight: 600; cursor: pointer; transition: background 0.2s;
+  }
+  .login-card button:hover { background: var(--blue-hover); }
+
+  /* --- Header --- */
+  .header {
+    background: var(--card-bg); border-bottom: 1px solid var(--gray-100);
+    padding: 12px 20px; position: sticky; top: 0; z-index: 100;
+    box-shadow: 0 1px 3px rgba(0,0,0,0.04);
+  }
+  .header-inner {
+    max-width: 900px; margin: 0 auto; display: flex;
+    align-items: center; justify-content: space-between; gap: 12px;
+  }
+  .header-left { display: flex; align-items: center; gap: 10px; min-width: 0; }
+  .header-logo { font-size: 20px; font-weight: 700; white-space: nowrap; }
+  .header-child { font-size: 14px; color: var(--gray-text); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .header-right { display: flex; align-items: center; gap: 12px; flex-shrink: 0; }
+  .status-badge {
+    display: inline-flex; align-items: center; gap: 6px; font-size: 13px;
+    font-weight: 500; padding: 4px 10px; border-radius: 20px; white-space: nowrap;
+  }
+  .status-badge.active { background: #d1f2d1; color: #1b7a1b; }
+  .status-badge.inactive { background: #fdd; color: #c00; }
+  .status-badge.outside { background: #fff3cd; color: #856404; }
+  .status-dot { width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0; }
+  .status-badge.active .status-dot { background: var(--green); }
+  .status-badge.inactive .status-dot { background: var(--red); }
+  .status-badge.outside .status-dot { background: var(--orange); }
+  .header-time { font-size: 13px; color: var(--gray-text); font-weight: 500; white-space: nowrap; }
+  .header-logout {
+    background: none; border: none; color: var(--gray-text); font-size: 13px;
+    cursor: pointer; padding: 4px 8px; border-radius: 6px;
+  }
+  .header-logout:hover { background: var(--gray-100); color: var(--gray-dark); }
+
+  /* --- Tab Bar --- */
+  .tab-bar {
+    background: var(--card-bg); border-bottom: 1px solid var(--gray-100);
+    overflow-x: auto; -webkit-overflow-scrolling: touch;
+    scrollbar-width: none;
+  }
+  .tab-bar::-webkit-scrollbar { display: none; }
+  .tab-bar-inner {
+    max-width: 900px; margin: 0 auto; display: flex; padding: 0 12px;
+  }
+  .tab-btn {
+    flex: 1; padding: 12px 16px; background: none; border: none;
+    border-bottom: 2px solid transparent; font-size: 14px; font-weight: 500;
+    color: var(--gray-text); cursor: pointer; white-space: nowrap;
+    text-align: center; transition: all 0.2s; min-width: 0;
+  }
+  .tab-btn:hover { color: var(--gray-dark); }
+  .tab-btn.active { color: var(--blue); border-bottom-color: var(--blue); }
+
+  /* --- Main Content --- */
+  .main { max-width: 900px; margin: 0 auto; padding: 20px 16px; }
+  .tab-content { display: none; }
+  .tab-content.active { display: block; }
+
+  /* --- Cards & Components --- */
+  .card {
+    background: var(--card-bg); border-radius: var(--radius); padding: 20px;
+    margin-bottom: 16px; box-shadow: var(--card-shadow);
+  }
+  .card-title { font-size: 17px; font-weight: 600; margin-bottom: 16px; }
+  .stats-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; margin-bottom: 16px; }
+  .stat { text-align: center; }
+  .stat-value { font-size: 32px; font-weight: 700; color: var(--blue); }
+  .stat-label { font-size: 12px; color: var(--gray-text); margin-top: 2px; }
+  .bar { height: 8px; background: var(--gray-100); border-radius: 4px; margin: 4px 0; overflow: hidden; }
+  .bar-fill { height: 100%; border-radius: 4px; transition: width 0.4s ease; background: var(--blue); }
+  .bar-fill.warning { background: var(--orange); }
+  .bar-fill.danger { background: var(--red); }
+  .bar-label { display: flex; justify-content: space-between; font-size: 12px; color: var(--gray-text); }
+
+  /* Controls */
+  .controls-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 10px; }
+  .ctrl-btn {
+    padding: 12px 16px; border: none; border-radius: var(--radius-sm);
+    font-size: 14px; font-weight: 500; cursor: pointer; transition: all 0.2s; text-align: center;
+  }
+  .ctrl-btn.primary { background: var(--blue); color: white; }
+  .ctrl-btn.primary:hover { background: var(--blue-hover); }
+  .ctrl-btn.secondary { background: var(--gray-100); color: var(--gray-dark); }
+  .ctrl-btn.secondary:hover { background: var(--gray-200); }
+  .ctrl-btn.danger { background: var(--red); color: white; }
+  .ctrl-btn.danger:hover { background: var(--red-hover); }
+
+  /* Tables */
   table { width: 100%; border-collapse: collapse; }
-  th, td { padding: 8px 12px; text-align: left; border-bottom: 1px solid #e5e5ea; }
-  th { font-weight: 600; color: #6e6e73; font-size: 13px; text-transform: uppercase; }
-  td { font-size: 14px; }
-  input, select { padding: 8px 12px; border: 1px solid #d2d2d7; border-radius: 8px;
-                  font-size: 14px; width: 100%; margin-bottom: 8px; }
-  button { padding: 10px 20px; background: #0071e3; color: white; border: none;
-           border-radius: 8px; font-size: 14px; cursor: pointer; margin-right: 8px; }
-  button:hover { background: #0077ed; }
-  button.danger { background: #ff3b30; }
-  button.danger:hover { background: #ff453a; }
-  .tag { display: inline-block; background: #e5e5ea; padding: 4px 10px;
-         border-radius: 6px; font-size: 13px; margin: 2px; }
-  .tag .remove { cursor: pointer; margin-left: 4px; color: #ff3b30; }
-  .form-row { display: flex; gap: 8px; align-items: center; margin-bottom: 8px; }
-  .form-row input { flex: 1; }
-  .form-row button { flex-shrink: 0; }
-  .event-type { font-weight: 600; font-size: 12px; padding: 2px 8px; border-radius: 4px; }
+  th, td { padding: 10px 12px; text-align: left; border-bottom: 1px solid var(--gray-100); font-size: 14px; }
+  th { font-weight: 600; color: var(--gray-text); font-size: 12px; text-transform: uppercase; letter-spacing: 0.5px; }
+  .event-type {
+    display: inline-block; font-weight: 600; font-size: 11px; padding: 3px 8px;
+    border-radius: 4px; text-transform: uppercase; letter-spacing: 0.3px;
+  }
   .event-type.firefox_start { background: #d1f2d1; color: #1b7a1b; }
   .event-type.firefox_stop { background: #fdd; color: #c00; }
   .event-type.time_limit_reached { background: #fff3cd; color: #856404; }
   .event-type.kiosk_start { background: #d1ecf1; color: #0c5460; }
-  #login { max-width: 300px; margin: 100px auto; }
+  .event-type.config_update { background: #e8daef; color: #6c3483; }
+  .event-type.time_reset { background: #d5f5e3; color: #1e8449; }
+
+  /* Forms */
+  label { display: block; font-size: 14px; font-weight: 500; margin-bottom: 6px; color: var(--gray-dark); }
+  input[type="number"], input[type="time"], input[type="url"], input[type="text"] {
+    width: 100%; padding: 10px 12px; border: 1.5px solid var(--gray-200);
+    border-radius: var(--radius-sm); font-size: 15px; outline: none; transition: border-color 0.2s;
+    background: var(--card-bg);
+  }
+  input:focus { border-color: var(--blue); }
+  .form-group { margin-bottom: 20px; }
+  .form-row { display: flex; gap: 8px; align-items: flex-end; }
+  .form-row input { flex: 1; margin-bottom: 0; }
+  .form-row span { font-size: 14px; color: var(--gray-text); padding-bottom: 10px; }
+  .save-btn {
+    padding: 10px 20px; background: var(--blue); color: white; border: none;
+    border-radius: var(--radius-sm); font-size: 14px; font-weight: 500;
+    cursor: pointer; transition: background 0.2s; flex-shrink: 0;
+  }
+  .save-btn:hover { background: var(--blue-hover); }
+
+  /* Tags */
+  .tag-list { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 12px; }
+  .tag {
+    display: inline-flex; align-items: center; gap: 4px; background: var(--gray-100);
+    padding: 6px 12px; border-radius: 20px; font-size: 13px;
+  }
+  .tag .remove { cursor: pointer; color: var(--red); font-weight: 700; font-size: 14px; line-height: 1; }
+  .tag .remove:hover { opacity: 0.7; }
+
+  /* Analytics Chart */
+  .chart-bar-row { display: flex; align-items: center; gap: 10px; margin-bottom: 8px; }
+  .chart-label { font-size: 12px; color: var(--gray-text); min-width: 48px; text-align: right; }
+  .chart-track { flex: 1; height: 24px; background: var(--gray-100); border-radius: 4px; overflow: hidden; position: relative; }
+  .chart-fill { height: 100%; background: var(--blue); border-radius: 4px; transition: width 0.4s ease; }
+  .chart-value { font-size: 12px; font-weight: 600; min-width: 36px; }
+  .trend-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 12px; }
+  .trend-card { text-align: center; padding: 16px; background: var(--gray-bg); border-radius: var(--radius-sm); }
+  .trend-value { font-size: 28px; font-weight: 700; }
+  .trend-label { font-size: 12px; color: var(--gray-text); margin-top: 2px; }
+
+  /* Empty state */
+  .empty { text-align: center; padding: 40px 20px; color: var(--gray-text); font-size: 14px; }
+
+  /* --- Responsive --- */
+  @media (max-width: 600px) {
+    .header-inner { flex-wrap: wrap; }
+    .header-right { width: 100%; justify-content: space-between; }
+    .stats-grid { grid-template-columns: repeat(3, 1fr); gap: 8px; }
+    .stat-value { font-size: 24px; }
+    .stat-label { font-size: 11px; }
+    .controls-grid { grid-template-columns: 1fr; }
+    .form-row { flex-direction: column; align-items: stretch; }
+    .form-row span { padding: 0; text-align: center; }
+    .save-btn { width: 100%; }
+    .trend-grid { grid-template-columns: repeat(2, 1fr); }
+    .toast-container { top: 8px; right: 8px; left: 8px; }
+    .toast { max-width: none; }
+    th, td { padding: 8px 6px; font-size: 13px; }
+    .main { padding: 16px 12px; }
+    .card { padding: 16px; }
+  }
+  @media (max-width: 374px) {
+    .tab-btn { font-size: 13px; padding: 10px 8px; }
+  }
 </style>
 </head>
 <body>
+<div id="toast-container" class="toast-container"></div>
 <div id="app"></div>
 <script>
 const app = document.getElementById('app');
+const toastContainer = document.getElementById('toast-container');
 let token = sessionStorage.getItem('kidsafe_token') || '';
+let activeTab = sessionStorage.getItem('kidsafe_tab') || 'overview';
+let cachedData = { status: null, config: null, history: null, events: null };
 
+/* --- Toast --- */
+function toast(msg, type='success') {
+  const el = document.createElement('div');
+  el.className = 'toast ' + type;
+  el.textContent = msg;
+  toastContainer.appendChild(el);
+  requestAnimationFrame(() => el.classList.add('show'));
+  setTimeout(() => {
+    el.classList.remove('show');
+    setTimeout(() => el.remove(), 300);
+  }, 3000);
+}
+
+/* --- API --- */
 async function api(path, method='GET', body=null) {
   const opts = { method, headers: {'Content-Type': 'application/json'} };
   if (token) opts.headers['Authorization'] = 'Bearer ' + token;
@@ -725,131 +925,258 @@ async function api(path, method='GET', body=null) {
   return res.json();
 }
 
+/* --- Auth --- */
 async function login(pass) {
   const data = await api('/login', 'POST', { password: pass });
-  if (data.token) { token = data.token; sessionStorage.setItem('kidsafe_token', token); render(); }
-  else alert('Wrong password');
+  if (data.token) {
+    token = data.token;
+    sessionStorage.setItem('kidsafe_token', token);
+    render();
+  } else {
+    toast('Wrong password', 'error');
+  }
 }
 
+function logout() {
+  token = '';
+  sessionStorage.removeItem('kidsafe_token');
+  render();
+}
+
+/* --- Login Screen --- */
 function showLogin() {
   app.innerHTML = `
-    <div id="login" class="card">
-      <h1>KidSafe</h1>
-      <p class="subtitle">Parent Dashboard</p>
-      <input type="password" id="pass" placeholder="Admin password" onkeydown="if(event.key==='Enter')document.getElementById('loginBtn').click()">
-      <button id="loginBtn">Log In</button>
+    <div class="login-wrapper">
+      <div class="login-card">
+        <div class="logo">&#x1F6E1;&#xFE0F;</div>
+        <h1>KidSafe</h1>
+        <p class="subtitle">Parent Dashboard</p>
+        <input type="password" id="pass" placeholder="Admin password"
+          onkeydown="if(event.key==='Enter')document.getElementById('loginBtn').click()">
+        <button id="loginBtn">Log In</button>
+      </div>
     </div>`;
   document.getElementById('loginBtn').onclick = () => login(document.getElementById('pass').value);
+  document.getElementById('pass').focus();
 }
 
+/* --- Tab Switching --- */
+function switchTab(tab) {
+  activeTab = tab;
+  sessionStorage.setItem('kidsafe_tab', tab);
+  document.querySelectorAll('.tab-btn').forEach(b => b.classList.toggle('active', b.dataset.tab === tab));
+  document.querySelectorAll('.tab-content').forEach(c => c.classList.toggle('active', c.id === 'tab-' + tab));
+}
+
+/* --- Status Helpers --- */
+function getStatusInfo(status) {
+  if (!status.firefox_running && !status.within_schedule) return { cls: 'outside', label: 'Outside Schedule' };
+  if (status.firefox_running) return { cls: 'active', label: 'Active' };
+  return { cls: 'inactive', label: 'Inactive' };
+}
+
+/* --- Render --- */
 async function render() {
   if (!token) return showLogin();
   const [status, config, history, events] = await Promise.all([
     api('/status'), api('/config'), api('/history'), api('/events')
   ]);
-  if (status.error === 'unauthorized') { token = ''; sessionStorage.removeItem('kidsafe_token'); return showLogin(); }
-
+  if (status.error === 'unauthorized') {
+    token = '';
+    sessionStorage.removeItem('kidsafe_token');
+    return showLogin();
+  }
+  cachedData = { status, config, history, events };
+  const si = getStatusInfo(status);
   const usedPct = Math.min(100, (status.used_minutes / config.daily_limit_minutes) * 100);
   const barClass = usedPct > 90 ? 'danger' : usedPct > 70 ? 'warning' : '';
+  const maxMin = (history || []).reduce((m, h) => Math.max(m, h.minutes), 1);
+  const avgMin = (history || []).length ? Math.round((history || []).reduce((s, h) => s + h.minutes, 0) / history.length) : 0;
+  const totalWeek = (history || []).reduce((s, h) => s + h.minutes, 0);
 
   app.innerHTML = `
-    <h1>KidSafe</h1>
-    <p class="subtitle">Parental Dashboard for ${config.child_user}</p>
-
-    <div class="card">
-      <div class="stat"><div class="stat-value">${status.remaining_minutes}</div><div class="stat-label">Minutes Left Today</div></div>
-      <div class="stat"><div class="stat-value">${status.used_minutes}</div><div class="stat-label">Minutes Used</div></div>
-      <div class="stat"><div class="stat-value">${status.firefox_running ? 'ON' : 'OFF'}</div><div class="stat-label">Firefox Status</div></div>
-      <div class="bar"><div class="bar-fill ${barClass}" style="width:${usedPct}%"></div></div>
-    </div>
-
-    <h2>Settings</h2>
-    <div class="card">
-      <label>Daily Time Limit (minutes)</label>
-      <div class="form-row">
-        <input type="number" id="limit" value="${config.daily_limit_minutes}" min="1" max="480">
-        <button onclick="saveLimit()">Save</button>
+    <div class="header"><div class="header-inner">
+      <div class="header-left">
+        <span class="header-logo">&#x1F6E1;&#xFE0F; KidSafe</span>
+        <span class="header-child">${config.child_user}</span>
       </div>
-      <label>Schedule</label>
-      <div class="form-row">
-        <input type="time" id="sched_start" value="${config.schedule.allowed_start}">
-        <span>to</span>
-        <input type="time" id="sched_end" value="${config.schedule.allowed_end}">
-        <button onclick="saveSchedule()">Save</button>
+      <div class="header-right">
+        <span class="status-badge ${si.cls}"><span class="status-dot"></span>${si.label}</span>
+        <span class="header-time">${status.remaining_minutes}m left</span>
+        <button class="header-logout" onclick="logout()">Log out</button>
       </div>
-      <label>Homepage</label>
-      <div class="form-row">
-        <input type="url" id="homepage" value="${config.homepage}">
-        <button onclick="saveHomepage()">Save</button>
+    </div></div>
+
+    <div class="tab-bar"><div class="tab-bar-inner">
+      <button class="tab-btn${activeTab==='overview'?' active':''}" data-tab="overview" onclick="switchTab('overview')">Overview</button>
+      <button class="tab-btn${activeTab==='activity'?' active':''}" data-tab="activity" onclick="switchTab('activity')">Activity</button>
+      <button class="tab-btn${activeTab==='analytics'?' active':''}" data-tab="analytics" onclick="switchTab('analytics')">Analytics</button>
+      <button class="tab-btn${activeTab==='settings'?' active':''}" data-tab="settings" onclick="switchTab('settings')">Settings</button>
+    </div></div>
+
+    <div class="main">
+
+      <!-- OVERVIEW TAB -->
+      <div id="tab-overview" class="tab-content${activeTab==='overview'?' active':''}">
+        <div class="card">
+          <div class="stats-grid">
+            <div class="stat"><div class="stat-value">${status.remaining_minutes}</div><div class="stat-label">Minutes Left</div></div>
+            <div class="stat"><div class="stat-value">${status.used_minutes}</div><div class="stat-label">Used Today</div></div>
+            <div class="stat"><div class="stat-value">${status.firefox_running ? 'ON' : 'OFF'}</div><div class="stat-label">Firefox</div></div>
+          </div>
+          <div class="bar-label"><span>${status.used_minutes} of ${config.daily_limit_minutes} min</span><span>${Math.round(usedPct)}%</span></div>
+          <div class="bar"><div class="bar-fill ${barClass}" style="width:${usedPct}%"></div></div>
+        </div>
+        <div class="card">
+          <div class="card-title">Quick Controls</div>
+          <div class="controls-grid">
+            <button class="ctrl-btn primary" onclick="resetTime()">Reset Time</button>
+            <button class="ctrl-btn secondary" onclick="applyPolicies()">Apply Policies</button>
+            <button class="ctrl-btn danger" onclick="stopKiosk()">Stop Kiosk</button>
+          </div>
+        </div>
       </div>
-    </div>
 
-    <h2>Allowed Sites</h2>
-    <div class="card">
-      <div id="sites">${config.allowed_sites.map(s => `<span class="tag">${s}<span class="remove" onclick="removeSite('${s}')">&times;</span></span>`).join(' ')}</div>
-      <div class="form-row" style="margin-top:12px">
-        <input type="text" id="newsite" placeholder="example.com">
-        <button onclick="addSite()">Add</button>
+      <!-- ACTIVITY TAB -->
+      <div id="tab-activity" class="tab-content${activeTab==='activity'?' active':''}">
+        <div class="card">
+          <div class="card-title">Recent Activity</div>
+          ${(events || []).length === 0 ? '<div class="empty">No recent events</div>' : `
+          <div style="overflow-x:auto">
+          <table><tr><th>Time</th><th>Event</th><th>Detail</th></tr>
+            ${(events || []).slice(0, 50).map(e => `<tr>
+              <td>${new Date(e.time).toLocaleString([], {month:'short',day:'numeric',hour:'2-digit',minute:'2-digit'})}</td>
+              <td><span class="event-type ${e.type}">${e.type.replace(/_/g, ' ')}</span></td>
+              <td>${e.detail || '\\u2014'}</td>
+            </tr>`).join('')}
+          </table></div>`}
+        </div>
       </div>
-    </div>
 
-    <h2>Usage History (7 days)</h2>
-    <div class="card">
-      <table><tr><th>Date</th><th>Minutes</th></tr>
-        ${(history || []).map(h => `<tr><td>${h.date}</td><td>${h.minutes}</td></tr>`).join('')}
-      </table>
-    </div>
+      <!-- ANALYTICS TAB -->
+      <div id="tab-analytics" class="tab-content${activeTab==='analytics'?' active':''}">
+        <div class="card">
+          <div class="card-title">Weekly Usage</div>
+          ${(history || []).length === 0 ? '<div class="empty">No usage data yet</div>' : `
+          ${(history || []).map(h => {
+            const pct = Math.round((h.minutes / maxMin) * 100);
+            return `<div class="chart-bar-row">
+              <span class="chart-label">${h.date.slice(5)}</span>
+              <div class="chart-track"><div class="chart-fill" style="width:${pct}%"></div></div>
+              <span class="chart-value">${h.minutes}m</span>
+            </div>`;
+          }).join('')}`}
+        </div>
+        <div class="card">
+          <div class="card-title">Trends</div>
+          <div class="trend-grid">
+            <div class="trend-card"><div class="trend-value" style="color:var(--blue)">${avgMin}</div><div class="trend-label">Avg Min / Day</div></div>
+            <div class="trend-card"><div class="trend-value" style="color:var(--green)">${totalWeek}</div><div class="trend-label">Total This Week</div></div>
+            <div class="trend-card"><div class="trend-value" style="color:var(--orange)">${config.daily_limit_minutes}</div><div class="trend-label">Daily Limit</div></div>
+            <div class="trend-card"><div class="trend-value" style="color:${usedPct > 90 ? 'var(--red)' : 'var(--blue)'}">${Math.round(usedPct)}%</div><div class="trend-label">Used Today</div></div>
+          </div>
+        </div>
+      </div>
 
-    <h2>Recent Activity</h2>
-    <div class="card">
-      <table><tr><th>Time</th><th>Event</th><th>Detail</th></tr>
-        ${(events || []).slice(0, 20).map(e => `<tr><td>${new Date(e.time).toLocaleString()}</td><td><span class="event-type ${e.type}">${e.type}</span></td><td>${e.detail || ''}</td></tr>`).join('')}
-      </table>
-    </div>
+      <!-- SETTINGS TAB -->
+      <div id="tab-settings" class="tab-content${activeTab==='settings'?' active':''}">
+        <div class="card">
+          <div class="card-title">Time Limit</div>
+          <div class="form-group">
+            <label>Daily limit (minutes)</label>
+            <div class="form-row">
+              <input type="number" id="limit" value="${config.daily_limit_minutes}" min="1" max="480">
+              <button class="save-btn" onclick="saveLimit()">Save</button>
+            </div>
+          </div>
+        </div>
+        <div class="card">
+          <div class="card-title">Schedule</div>
+          <div class="form-group">
+            <label>Allowed hours</label>
+            <div class="form-row">
+              <input type="time" id="sched_start" value="${config.schedule.allowed_start}">
+              <span>to</span>
+              <input type="time" id="sched_end" value="${config.schedule.allowed_end}">
+              <button class="save-btn" onclick="saveSchedule()">Save</button>
+            </div>
+          </div>
+        </div>
+        <div class="card">
+          <div class="card-title">Homepage</div>
+          <div class="form-group">
+            <label>Default page when Firefox opens</label>
+            <div class="form-row">
+              <input type="url" id="homepage" value="${config.homepage}">
+              <button class="save-btn" onclick="saveHomepage()">Save</button>
+            </div>
+          </div>
+        </div>
+        <div class="card">
+          <div class="card-title">Allowed Sites</div>
+          <div class="tag-list" id="sites">${config.allowed_sites.map(s => `<span class="tag">${s}<span class="remove" onclick="removeSite('${s}')">&times;</span></span>`).join('')}</div>
+          <div class="form-row">
+            <input type="text" id="newsite" placeholder="example.com"
+              onkeydown="if(event.key==='Enter')addSite()">
+            <button class="save-btn" onclick="addSite()">Add Site</button>
+          </div>
+        </div>
+      </div>
 
-    <h2>Controls</h2>
-    <div class="card">
-      <button onclick="resetTime()">Reset Today's Time</button>
-      <button onclick="applyPolicies()">Apply Firefox Policies</button>
-      <button class="danger" onclick="stopKiosk()">Stop Kiosk</button>
     </div>`;
 }
 
+/* --- Actions --- */
 async function saveLimit() {
   await api('/config', 'POST', { daily_limit_minutes: parseInt(document.getElementById('limit').value) });
+  toast('Time limit saved');
   render();
 }
 async function saveSchedule() {
   await api('/config', 'POST', { schedule: { enabled: true, allowed_start: document.getElementById('sched_start').value, allowed_end: document.getElementById('sched_end').value }});
+  toast('Schedule saved');
   render();
 }
 async function saveHomepage() {
   await api('/config', 'POST', { homepage: document.getElementById('homepage').value });
+  toast('Homepage saved');
   render();
 }
 async function addSite() {
-  const site = document.getElementById('newsite').value.trim().replace(/^https?:\\/\\//, '').replace(/\\/+$/, '');
+  const input = document.getElementById('newsite');
+  const site = input.value.trim().replace(/^https?:\\/\\//, '').replace(/\\/+$/, '');
   if (!site) return;
   const cfg = await api('/config');
+  if (cfg.allowed_sites.includes(site)) { toast('Site already allowed', 'info'); return; }
   cfg.allowed_sites.push(site);
   await api('/config', 'POST', { allowed_sites: cfg.allowed_sites });
+  toast(site + ' added');
   render();
 }
 async function removeSite(site) {
   const cfg = await api('/config');
   cfg.allowed_sites = cfg.allowed_sites.filter(s => s !== site);
   await api('/config', 'POST', { allowed_sites: cfg.allowed_sites });
+  toast(site + ' removed');
   render();
 }
 async function resetTime() {
-  if (confirm('Reset today\\'s time usage to zero?')) { await api('/reset-time', 'POST'); render(); }
+  if (confirm('Reset today\\'s time usage to zero?')) {
+    await api('/reset-time', 'POST');
+    toast('Time reset to zero');
+    render();
+  }
 }
 async function applyPolicies() {
   const r = await api('/apply-policies', 'POST');
-  alert(r.message || 'Done');
+  toast(r.message || 'Policies applied', r.ok ? 'success' : 'error');
 }
 async function stopKiosk() {
-  if (confirm('Stop the kiosk? Firefox will close.')) { await api('/stop-kiosk', 'POST'); render(); }
+  if (confirm('Stop the kiosk? Firefox will close.')) {
+    await api('/stop-kiosk', 'POST');
+    toast('Kiosk stopped');
+    render();
+  }
 }
 
 render();
