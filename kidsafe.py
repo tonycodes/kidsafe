@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import signal
 import sqlite3
 import subprocess
@@ -123,6 +124,23 @@ def init_db() -> None:
             detail TEXT
         )
     """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS browsing_history (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp TEXT NOT NULL,
+            domain TEXT NOT NULL,
+            url TEXT NOT NULL,
+            duration_seconds INTEGER DEFAULT 0
+        )
+    """)
+    conn.execute("""
+        CREATE INDEX IF NOT EXISTS idx_browsing_history_timestamp
+        ON browsing_history (timestamp)
+    """)
+    conn.execute("""
+        CREATE INDEX IF NOT EXISTS idx_browsing_history_domain
+        ON browsing_history (domain)
+    """)
     conn.commit()
     conn.close()
 
@@ -197,6 +215,91 @@ def get_recent_events(limit: int = 50) -> List[Dict[str, Any]]:
         return [{"time": r[0], "type": r[1], "detail": r[2]} for r in rows]
     except Exception:
         return []
+
+
+def record_browsing_history(domain: str, url: str, duration_seconds: int = 0) -> None:
+    """Record a browsing history entry."""
+    try:
+        conn = sqlite3.connect(str(DB_FILE))
+        conn.execute(
+            "INSERT INTO browsing_history (timestamp, domain, url, duration_seconds) "
+            "VALUES (?, ?, ?, ?)",
+            (datetime.now().isoformat(), domain, url, duration_seconds)
+        )
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        log(f"DB error recording browsing history: {e}")
+
+
+def get_browsing_history(
+    page: int = 1,
+    per_page: int = 50,
+    domain: Optional[str] = None,
+    date_from: Optional[str] = None,
+    date_to: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Get paginated browsing history with optional filters."""
+    try:
+        conn = sqlite3.connect(str(DB_FILE))
+        conditions: List[str] = []
+        params: List[Any] = []
+
+        if domain:
+            conditions.append("domain LIKE ?")
+            params.append(f"%{domain}%")
+        if date_from:
+            conditions.append("timestamp >= ?")
+            params.append(date_from)
+        if date_to:
+            conditions.append("timestamp <= ?")
+            # Include the full day if only a date is given
+            if len(date_to) == 10:
+                params.append(date_to + "T23:59:59")
+            else:
+                params.append(date_to)
+
+        where = ""
+        if conditions:
+            where = "WHERE " + " AND ".join(conditions)
+
+        # Get total count
+        count_row = conn.execute(
+            f"SELECT COUNT(*) FROM browsing_history {where}", params
+        ).fetchone()
+        total = count_row[0] if count_row else 0
+
+        # Get paginated results
+        offset = (page - 1) * per_page
+        rows = conn.execute(
+            f"SELECT id, timestamp, domain, url, duration_seconds "
+            f"FROM browsing_history {where} "
+            f"ORDER BY id DESC LIMIT ? OFFSET ?",
+            params + [per_page, offset]
+        ).fetchall()
+        conn.close()
+
+        items = [
+            {
+                "id": r[0],
+                "timestamp": r[1],
+                "domain": r[2],
+                "url": r[3],
+                "duration_seconds": r[4],
+            }
+            for r in rows
+        ]
+
+        return {
+            "items": items,
+            "total": total,
+            "page": page,
+            "per_page": per_page,
+            "total_pages": max(1, (total + per_page - 1) // per_page),
+        }
+    except Exception as e:
+        log(f"DB error fetching browsing history: {e}")
+        return {"items": [], "total": 0, "page": 1, "per_page": per_page, "total_pages": 1}
 
 
 # --- Config ---
@@ -363,6 +466,150 @@ def apply_firefox_policies(config: Dict[str, Any]) -> bool:
         return False
 
 
+# --- Browsing History Tracker ---
+
+
+def find_firefox_places_db() -> Optional[Path]:
+    """Find Firefox's places.sqlite database in the default profile."""
+    profiles_dir = Path.home() / "Library" / "Application Support" / "Firefox" / "Profiles"
+    if not profiles_dir.exists():
+        return None
+    # Look for the default-release profile first, then any profile
+    for pattern in ["*.default-release", "*.default", "*"]:
+        for profile in profiles_dir.glob(pattern):
+            places = profile / "places.sqlite"
+            if places.exists():
+                return places
+    return None
+
+
+class BrowsingTracker:
+    """Tracks browsing history by reading Firefox's places.sqlite."""
+
+    def __init__(self, check_interval: int = 30) -> None:
+        self.check_interval: int = check_interval
+        self.running: bool = False
+        self.thread: Optional[threading.Thread] = None
+        self.last_visit_id: int = 0
+        self._current_url: Optional[str] = None
+        self._current_url_start: Optional[datetime] = None
+
+    def start(self) -> None:
+        """Start the browsing tracker background thread."""
+        self.running = True
+        self.thread = threading.Thread(target=self._run, daemon=True)
+        self.thread.start()
+        log("Browsing history tracker started")
+
+    def stop(self) -> None:
+        """Stop the browsing tracker."""
+        self._flush_current_page()
+        self.running = False
+
+    def _flush_current_page(self) -> None:
+        """Record duration for the current page before moving on."""
+        if self._current_url and self._current_url_start:
+            duration = int((datetime.now() - self._current_url_start).total_seconds())
+            if duration > 0:
+                domain = urlparse(self._current_url).netloc
+                record_browsing_history(domain, self._current_url, duration)
+
+    def _poll_firefox_history(self) -> None:
+        """Read new history entries from Firefox's places.sqlite."""
+        places_db = find_firefox_places_db()
+        if not places_db:
+            return
+
+        try:
+            # Copy the database to avoid locking issues with Firefox
+            tmp_db = CONFIG_DIR / "places_copy.sqlite"
+            shutil.copy2(str(places_db), str(tmp_db))
+
+            conn = sqlite3.connect(str(tmp_db))
+            # moz_historyvisits has: id, from_visit, place_id, visit_date, visit_type
+            # moz_places has: id, url, title, rev_host, visit_count, ...
+            # visit_date is in microseconds since epoch
+            rows = conn.execute(
+                "SELECT v.id, p.url, v.visit_date "
+                "FROM moz_historyvisits v "
+                "JOIN moz_places p ON v.place_id = p.id "
+                "WHERE v.id > ? "
+                "ORDER BY v.id ASC",
+                (self.last_visit_id,)
+            ).fetchall()
+            conn.close()
+
+            # Clean up temp file
+            try:
+                tmp_db.unlink()
+            except Exception:
+                pass
+
+            for row in rows:
+                visit_id: int = row[0]
+                url: str = row[1]
+                visit_date_us: int = row[2]
+                self.last_visit_id = visit_id
+
+                # Skip internal Firefox URLs
+                if url.startswith(("about:", "moz-", "chrome:", "resource:", "file:")):
+                    continue
+
+                parsed = urlparse(url)
+                domain = parsed.netloc
+                if not domain:
+                    continue
+
+                # Calculate duration: if we had a previous URL, flush it
+                now = datetime.now()
+                if self._current_url and self._current_url != url:
+                    self._flush_current_page()
+
+                self._current_url = url
+                # Use Firefox's visit timestamp if available
+                if visit_date_us:
+                    visit_time = datetime.fromtimestamp(visit_date_us / 1_000_000)
+                    self._current_url_start = visit_time
+                else:
+                    self._current_url_start = now
+
+                # Record the visit with 0 duration initially (duration updated on next visit)
+                record_browsing_history(domain, url, 0)
+
+        except Exception as e:
+            log(f"Browsing tracker error: {e}")
+
+    def _run(self) -> None:
+        """Background thread loop."""
+        # Initialize last_visit_id from Firefox DB to avoid importing old history
+        places_db = find_firefox_places_db()
+        if places_db:
+            try:
+                tmp_db = CONFIG_DIR / "places_copy.sqlite"
+                shutil.copy2(str(places_db), str(tmp_db))
+                conn = sqlite3.connect(str(tmp_db))
+                row = conn.execute(
+                    "SELECT MAX(id) FROM moz_historyvisits"
+                ).fetchone()
+                conn.close()
+                try:
+                    tmp_db.unlink()
+                except Exception:
+                    pass
+                if row and row[0]:
+                    self.last_visit_id = row[0]
+                    log(f"Browsing tracker initialized at visit ID {self.last_visit_id}")
+            except Exception as e:
+                log(f"Error initializing browsing tracker: {e}")
+
+        while self.running:
+            try:
+                self._poll_firefox_history()
+            except Exception as e:
+                log(f"Browsing tracker error: {e}")
+            time.sleep(self.check_interval)
+
+
 # --- Firefox Kiosk Manager ---
 
 # --- App Enforcer (kills unauthorized apps) ---
@@ -460,6 +707,7 @@ class KioskManager:
         self.running: bool = False
         self.session_seconds: int = 0
         self.enforcer: AppEnforcer = AppEnforcer(check_interval=2)
+        self.browsing_tracker: BrowsingTracker = BrowsingTracker(check_interval=30)
 
     def is_within_schedule(self) -> bool:
         """Check if current time is within allowed schedule."""
@@ -596,6 +844,9 @@ class KioskManager:
         # Start the app enforcer — kills any non-whitelisted GUI apps
         self.enforcer.start()
 
+        # Start browsing history tracker
+        self.browsing_tracker.start()
+
         while self.running:
             try:
                 # Check schedule
@@ -652,6 +903,7 @@ class KioskManager:
                 log(f"Kiosk loop error: {e}")
                 time.sleep(5)
 
+        self.browsing_tracker.stop()
         self.enforcer.stop()
         self.stop_firefox()
         record_event("kiosk_stop")
@@ -708,6 +960,25 @@ DASHBOARD_HTML: str = """<!DOCTYPE html>
   .event-type.firefox_stop { background: #fdd; color: #c00; }
   .event-type.time_limit_reached { background: #fff3cd; color: #856404; }
   .event-type.kiosk_start { background: #d1ecf1; color: #0c5460; }
+  .tabs { display: flex; gap: 0; margin-bottom: 24px; border-bottom: 2px solid #e5e5ea; }
+  .tab { padding: 10px 20px; cursor: pointer; font-size: 14px; font-weight: 600; color: #6e6e73;
+         border-bottom: 2px solid transparent; margin-bottom: -2px; transition: all 0.2s; }
+  .tab:hover { color: #1d1d1f; }
+  .tab.active { color: #0071e3; border-bottom-color: #0071e3; }
+  .tab-content { display: none; }
+  .tab-content.active { display: block; }
+  .filter-row { display: flex; gap: 8px; margin-bottom: 16px; flex-wrap: wrap; }
+  .filter-row input { flex: 1; min-width: 120px; }
+  .pagination { display: flex; justify-content: space-between; align-items: center; margin-top: 12px;
+                padding-top: 12px; border-top: 1px solid #e5e5ea; }
+  .pagination button { padding: 6px 14px; font-size: 13px; }
+  .pagination button:disabled { opacity: 0.5; cursor: not-allowed; }
+  .page-info { font-size: 13px; color: #6e6e73; }
+  .url-cell { max-width: 300px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .duration { font-variant-numeric: tabular-nums; }
+  .sortable { cursor: pointer; user-select: none; }
+  .sortable:hover { color: #0071e3; }
+  .sortable::after { content: ' \u2195'; font-size: 10px; }
   #login { max-width: 300px; margin: 100px auto; }
 </style>
 </head>
@@ -742,6 +1013,72 @@ function showLogin() {
   document.getElementById('loginBtn').onclick = () => login(document.getElementById('pass').value);
 }
 
+let activeTab = 'overview';
+let browsingPage = 1;
+let browsingSort = { col: 'timestamp', dir: 'desc' };
+
+function switchTab(tab) {
+  activeTab = tab;
+  document.querySelectorAll('.tab').forEach(t => t.classList.toggle('active', t.dataset.tab === tab));
+  document.querySelectorAll('.tab-content').forEach(c => c.classList.toggle('active', c.id === 'tab-' + tab));
+  if (tab === 'activity') loadBrowsingHistory();
+}
+
+function formatDuration(secs) {
+  if (!secs || secs === 0) return '-';
+  if (secs < 60) return secs + 's';
+  if (secs < 3600) return Math.floor(secs / 60) + 'm ' + (secs % 60) + 's';
+  return Math.floor(secs / 3600) + 'h ' + Math.floor((secs % 3600) / 60) + 'm';
+}
+
+async function loadBrowsingHistory() {
+  const domain = (document.getElementById('bh-domain') || {}).value || '';
+  const dateFrom = (document.getElementById('bh-from') || {}).value || '';
+  const dateTo = (document.getElementById('bh-to') || {}).value || '';
+  let url = '/browsing-history?page=' + browsingPage + '&per_page=50';
+  if (domain) url += '&domain=' + encodeURIComponent(domain);
+  if (dateFrom) url += '&date_from=' + encodeURIComponent(dateFrom);
+  if (dateTo) url += '&date_to=' + encodeURIComponent(dateTo);
+  const data = await api(url);
+  const items = data.items || [];
+
+  // Client-side sort
+  items.sort((a, b) => {
+    let va = a[browsingSort.col], vb = b[browsingSort.col];
+    if (browsingSort.col === 'duration_seconds') { va = va || 0; vb = vb || 0; }
+    if (va < vb) return browsingSort.dir === 'asc' ? -1 : 1;
+    if (va > vb) return browsingSort.dir === 'asc' ? 1 : -1;
+    return 0;
+  });
+
+  const tbody = document.getElementById('bh-tbody');
+  if (tbody) {
+    tbody.innerHTML = items.length === 0
+      ? '<tr><td colspan="4" style="text-align:center;color:#6e6e73;padding:24px">No browsing history found</td></tr>'
+      : items.map(i => `<tr>
+          <td>${i.domain}</td>
+          <td class="url-cell" title="${i.url}">${i.url}</td>
+          <td>${new Date(i.timestamp).toLocaleString()}</td>
+          <td class="duration">${formatDuration(i.duration_seconds)}</td>
+        </tr>`).join('');
+  }
+  const pageInfo = document.getElementById('bh-page-info');
+  if (pageInfo) pageInfo.textContent = 'Page ' + data.page + ' of ' + data.total_pages + ' (' + data.total + ' total)';
+  const prevBtn = document.getElementById('bh-prev');
+  const nextBtn = document.getElementById('bh-next');
+  if (prevBtn) prevBtn.disabled = data.page <= 1;
+  if (nextBtn) nextBtn.disabled = data.page >= data.total_pages;
+}
+
+function bhSort(col) {
+  if (browsingSort.col === col) browsingSort.dir = browsingSort.dir === 'asc' ? 'desc' : 'asc';
+  else { browsingSort.col = col; browsingSort.dir = 'desc'; }
+  loadBrowsingHistory();
+}
+function bhPrev() { browsingPage = Math.max(1, browsingPage - 1); loadBrowsingHistory(); }
+function bhNext() { browsingPage++; loadBrowsingHistory(); }
+function bhSearch() { browsingPage = 1; loadBrowsingHistory(); }
+
 async function render() {
   if (!token) return showLogin();
   const [status, config, history, events] = await Promise.all([
@@ -763,56 +1100,93 @@ async function render() {
       <div class="bar"><div class="bar-fill ${barClass}" style="width:${usedPct}%"></div></div>
     </div>
 
-    <h2>Settings</h2>
-    <div class="card">
-      <label>Daily Time Limit (minutes)</label>
-      <div class="form-row">
-        <input type="number" id="limit" value="${config.daily_limit_minutes}" min="1" max="480">
-        <button onclick="saveLimit()">Save</button>
+    <div class="tabs">
+      <div class="tab ${activeTab==='overview'?'active':''}" data-tab="overview" onclick="switchTab('overview')">Overview</div>
+      <div class="tab ${activeTab==='activity'?'active':''}" data-tab="activity" onclick="switchTab('activity')">Activity</div>
+    </div>
+
+    <div id="tab-overview" class="tab-content ${activeTab==='overview'?'active':''}">
+      <h2>Settings</h2>
+      <div class="card">
+        <label>Daily Time Limit (minutes)</label>
+        <div class="form-row">
+          <input type="number" id="limit" value="${config.daily_limit_minutes}" min="1" max="480">
+          <button onclick="saveLimit()">Save</button>
+        </div>
+        <label>Schedule</label>
+        <div class="form-row">
+          <input type="time" id="sched_start" value="${config.schedule.allowed_start}">
+          <span>to</span>
+          <input type="time" id="sched_end" value="${config.schedule.allowed_end}">
+          <button onclick="saveSchedule()">Save</button>
+        </div>
+        <label>Homepage</label>
+        <div class="form-row">
+          <input type="url" id="homepage" value="${config.homepage}">
+          <button onclick="saveHomepage()">Save</button>
+        </div>
       </div>
-      <label>Schedule</label>
-      <div class="form-row">
-        <input type="time" id="sched_start" value="${config.schedule.allowed_start}">
-        <span>to</span>
-        <input type="time" id="sched_end" value="${config.schedule.allowed_end}">
-        <button onclick="saveSchedule()">Save</button>
+
+      <h2>Allowed Sites</h2>
+      <div class="card">
+        <div id="sites">${config.allowed_sites.map(s => `<span class="tag">${s}<span class="remove" onclick="removeSite('${s}')">&times;</span></span>`).join(' ')}</div>
+        <div class="form-row" style="margin-top:12px">
+          <input type="text" id="newsite" placeholder="example.com">
+          <button onclick="addSite()">Add</button>
+        </div>
       </div>
-      <label>Homepage</label>
-      <div class="form-row">
-        <input type="url" id="homepage" value="${config.homepage}">
-        <button onclick="saveHomepage()">Save</button>
+
+      <h2>Usage History (7 days)</h2>
+      <div class="card">
+        <table><tr><th>Date</th><th>Minutes</th></tr>
+          ${(history || []).map(h => `<tr><td>${h.date}</td><td>${h.minutes}</td></tr>`).join('')}
+        </table>
+      </div>
+
+      <h2>Recent Activity</h2>
+      <div class="card">
+        <table><tr><th>Time</th><th>Event</th><th>Detail</th></tr>
+          ${(events || []).slice(0, 20).map(e => `<tr><td>${new Date(e.time).toLocaleString()}</td><td><span class="event-type ${e.type}">${e.type}</span></td><td>${e.detail || ''}</td></tr>`).join('')}
+        </table>
+      </div>
+
+      <h2>Controls</h2>
+      <div class="card">
+        <button onclick="resetTime()">Reset Today's Time</button>
+        <button onclick="applyPolicies()">Apply Firefox Policies</button>
+        <button class="danger" onclick="stopKiosk()">Stop Kiosk</button>
       </div>
     </div>
 
-    <h2>Allowed Sites</h2>
-    <div class="card">
-      <div id="sites">${config.allowed_sites.map(s => `<span class="tag">${s}<span class="remove" onclick="removeSite('${s}')">&times;</span></span>`).join(' ')}</div>
-      <div class="form-row" style="margin-top:12px">
-        <input type="text" id="newsite" placeholder="example.com">
-        <button onclick="addSite()">Add</button>
+    <div id="tab-activity" class="tab-content ${activeTab==='activity'?'active':''}">
+      <h2>Browsing History</h2>
+      <div class="card">
+        <div class="filter-row">
+          <input type="text" id="bh-domain" placeholder="Filter by domain..." onkeydown="if(event.key==='Enter')bhSearch()">
+          <input type="date" id="bh-from" placeholder="From date">
+          <input type="date" id="bh-to" placeholder="To date">
+          <button onclick="bhSearch()">Search</button>
+        </div>
+        <table>
+          <tr>
+            <th class="sortable" onclick="bhSort('domain')">Domain</th>
+            <th>URL</th>
+            <th class="sortable" onclick="bhSort('timestamp')">Timestamp</th>
+            <th class="sortable" onclick="bhSort('duration_seconds')">Duration</th>
+          </tr>
+          <tbody id="bh-tbody">
+            <tr><td colspan="4" style="text-align:center;color:#6e6e73;padding:24px">Loading...</td></tr>
+          </tbody>
+        </table>
+        <div class="pagination">
+          <button id="bh-prev" onclick="bhPrev()" disabled>Previous</button>
+          <span id="bh-page-info" class="page-info">Page 1</span>
+          <button id="bh-next" onclick="bhNext()">Next</button>
+        </div>
       </div>
-    </div>
-
-    <h2>Usage History (7 days)</h2>
-    <div class="card">
-      <table><tr><th>Date</th><th>Minutes</th></tr>
-        ${(history || []).map(h => `<tr><td>${h.date}</td><td>${h.minutes}</td></tr>`).join('')}
-      </table>
-    </div>
-
-    <h2>Recent Activity</h2>
-    <div class="card">
-      <table><tr><th>Time</th><th>Event</th><th>Detail</th></tr>
-        ${(events || []).slice(0, 20).map(e => `<tr><td>${new Date(e.time).toLocaleString()}</td><td><span class="event-type ${e.type}">${e.type}</span></td><td>${e.detail || ''}</td></tr>`).join('')}
-      </table>
-    </div>
-
-    <h2>Controls</h2>
-    <div class="card">
-      <button onclick="resetTime()">Reset Today's Time</button>
-      <button onclick="applyPolicies()">Apply Firefox Policies</button>
-      <button class="danger" onclick="stopKiosk()">Stop Kiosk</button>
     </div>`;
+
+  if (activeTab === 'activity') loadBrowsingHistory();
 }
 
 async function saveLimit() {
@@ -884,7 +1258,11 @@ class DashboardHandler(BaseHTTPRequestHandler):
         return False
 
     def do_GET(self) -> None:
-        if self.path == "/" or self.path == "/dashboard":
+        parsed = urlparse(self.path)
+        parsed_path = parsed.path
+        parsed_query = parsed.query
+
+        if parsed_path == "/" or parsed_path == "/dashboard":
             self.send_response(200)
             self.send_header("Content-Type", "text/html")
             self.end_headers()
@@ -896,7 +1274,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
             return
 
         assert DashboardHandler.config is not None
-        if self.path == "/api/status":
+        if parsed_path == "/api/status":
             used = get_today_usage()
             limit = DashboardHandler.config["daily_limit_minutes"] * 60
             self.send_json({
@@ -906,13 +1284,27 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 "firefox_running": DashboardHandler.kiosk.is_firefox_running() if DashboardHandler.kiosk else False,
                 "within_schedule": DashboardHandler.kiosk.is_within_schedule() if DashboardHandler.kiosk else True
             })
-        elif self.path == "/api/config":
+        elif parsed_path == "/api/config":
             safe_config = {k: v for k, v in DashboardHandler.config.items() if k != "admin_password_hash"}
             self.send_json(safe_config)
-        elif self.path == "/api/history":
+        elif parsed_path == "/api/history":
             self.send_json(get_usage_history())
-        elif self.path == "/api/events":
+        elif parsed_path == "/api/events":
             self.send_json(get_recent_events())
+        elif parsed_path == "/api/browsing-history":
+            params = parse_qs(parsed_query)
+            page = int(params.get("page", ["1"])[0])
+            per_page = int(params.get("per_page", ["50"])[0])
+            domain = params.get("domain", [None])[0]
+            date_from = params.get("date_from", [None])[0]
+            date_to = params.get("date_to", [None])[0]
+            self.send_json(get_browsing_history(
+                page=max(1, page),
+                per_page=min(100, max(1, per_page)),
+                domain=domain,
+                date_from=date_from,
+                date_to=date_to,
+            ))
         else:
             self.send_json({"error": "not found"}, 404)
 
