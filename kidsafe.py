@@ -120,20 +120,55 @@ def init_db() -> None:
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             timestamp TEXT NOT NULL,
             event_type TEXT NOT NULL,
-            detail TEXT
+            detail TEXT,
+            category TEXT,
+            blocked_name TEXT,
+            blocked_domain TEXT,
+            block_reason TEXT
         )
+    """)
+    # Add enriched columns to existing databases (safe to run multiple times)
+    for col, col_type in [
+        ("category", "TEXT"),
+        ("blocked_name", "TEXT"),
+        ("blocked_domain", "TEXT"),
+        ("block_reason", "TEXT"),
+    ]:
+        try:
+            conn.execute(f"ALTER TABLE events ADD COLUMN {col} {col_type}")
+        except sqlite3.OperationalError:
+            pass  # Column already exists
+    conn.execute("""
+        CREATE INDEX IF NOT EXISTS idx_events_category ON events (category)
     """)
     conn.commit()
     conn.close()
 
 
-def record_event(event_type: str, detail: str = "") -> None:
-    """Record an event to the database."""
+def record_event(
+    event_type: str,
+    detail: str = "",
+    category: str = "",
+    blocked_name: str = "",
+    blocked_domain: str = "",
+    block_reason: str = "",
+) -> None:
+    """Record an event to the database with optional enriched block detail."""
     try:
         conn = sqlite3.connect(str(DB_FILE))
         conn.execute(
-            "INSERT INTO events (timestamp, event_type, detail) VALUES (?, ?, ?)",
-            (datetime.now().isoformat(), event_type, detail)
+            "INSERT INTO events (timestamp, event_type, detail, category, "
+            "blocked_name, blocked_domain, block_reason) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (
+                datetime.now().isoformat(),
+                event_type,
+                detail,
+                category or None,
+                blocked_name or None,
+                blocked_domain or None,
+                block_reason or None,
+            ),
         )
         conn.commit()
         conn.close()
@@ -190,13 +225,103 @@ def get_recent_events(limit: int = 50) -> List[Dict[str, Any]]:
     try:
         conn = sqlite3.connect(str(DB_FILE))
         rows = conn.execute(
-            "SELECT timestamp, event_type, detail FROM events ORDER BY id DESC LIMIT ?",
+            "SELECT timestamp, event_type, detail, category, blocked_name, "
+            "blocked_domain, block_reason FROM events ORDER BY id DESC LIMIT ?",
             (limit,)
         ).fetchall()
         conn.close()
-        return [{"time": r[0], "type": r[1], "detail": r[2]} for r in rows]
+        return [
+            {
+                "time": r[0], "type": r[1], "detail": r[2],
+                "category": r[3], "blocked_name": r[4],
+                "blocked_domain": r[5], "block_reason": r[6],
+            }
+            for r in rows
+        ]
     except Exception:
         return []
+
+
+def get_blocked_events(
+    block_type: str = "",
+    start_date: str = "",
+    end_date: str = "",
+    limit: int = 100,
+) -> Dict[str, Any]:
+    """Get blocked events with filtering, counts, and most-blocked summary."""
+    try:
+        conn = sqlite3.connect(str(DB_FILE))
+        where_clauses = ["category IS NOT NULL"]
+        params: List[Any] = []
+
+        if block_type:
+            where_clauses.append("category = ?")
+            params.append(block_type)
+        if start_date:
+            where_clauses.append("timestamp >= ?")
+            params.append(start_date)
+        if end_date:
+            where_clauses.append("timestamp <= ?")
+            params.append(end_date + "T23:59:59")
+
+        where_sql = " AND ".join(where_clauses)
+
+        # Filtered events
+        rows = conn.execute(
+            f"SELECT timestamp, event_type, detail, category, blocked_name, "
+            f"blocked_domain, block_reason FROM events "
+            f"WHERE {where_sql} ORDER BY id DESC LIMIT ?",
+            params + [limit],
+        ).fetchall()
+
+        events = [
+            {
+                "time": r[0], "type": r[1], "detail": r[2],
+                "category": r[3], "blocked_name": r[4],
+                "blocked_domain": r[5], "block_reason": r[6],
+            }
+            for r in rows
+        ]
+
+        # Counts by category (ignoring type/date filters for summary)
+        count_where = "category IS NOT NULL"
+        count_params: List[Any] = []
+        if start_date:
+            count_where += " AND timestamp >= ?"
+            count_params.append(start_date)
+        if end_date:
+            count_where += " AND timestamp <= ?"
+            count_params.append(end_date + "T23:59:59")
+
+        count_rows = conn.execute(
+            f"SELECT category, COUNT(*) FROM events "
+            f"WHERE {count_where} GROUP BY category",
+            count_params,
+        ).fetchall()
+        counts = {r[0]: r[1] for r in count_rows}
+
+        # Top 5 most blocked apps/sites
+        top_rows = conn.execute(
+            f"SELECT COALESCE(blocked_name, blocked_domain, detail) as name, "
+            f"category, COUNT(*) as cnt FROM events "
+            f"WHERE {count_where} AND "
+            f"COALESCE(blocked_name, blocked_domain, detail) IS NOT NULL "
+            f"GROUP BY name, category ORDER BY cnt DESC LIMIT 5",
+            count_params,
+        ).fetchall()
+        most_blocked = [
+            {"name": r[0], "category": r[1], "count": r[2]} for r in top_rows
+        ]
+
+        conn.close()
+        return {
+            "events": events,
+            "counts": counts,
+            "most_blocked": most_blocked,
+            "total": sum(counts.values()),
+        }
+    except Exception:
+        return {"events": [], "counts": {}, "most_blocked": [], "total": 0}
 
 
 # --- Config ---
@@ -357,6 +482,15 @@ def apply_firefox_policies(config: Dict[str, Any]) -> bool:
             json.dump(policies, f, indent=2)
         log("Firefox policies applied")
         record_event("policy_update", "Firefox policies updated")
+        # Log each explicitly blocked site
+        for site in config.get("blocked_sites", []):
+            record_event(
+                "site_blocked",
+                site,
+                category="site_blocked",
+                blocked_domain=site,
+                block_reason="Site in blocklist",
+            )
         return True
     except PermissionError:
         log("ERROR: Cannot write Firefox policies — need admin permissions")
@@ -442,7 +576,13 @@ class AppEnforcer:
                 killed = kill_unauthorized_apps()
                 for app in killed:
                     log(f"Killed unauthorized app: {app}")
-                    record_event("app_blocked", app)
+                    record_event(
+                        "app_blocked",
+                        app,
+                        category="app_blocked",
+                        blocked_name=app,
+                        block_reason="App not in whitelist",
+                    )
             except Exception as e:
                 log(f"Enforcer error: {e}")
             time.sleep(self.check_interval)
@@ -603,7 +743,14 @@ class KioskManager:
                     if self.is_firefox_running():
                         self.stop_firefox()
                     self.show_outside_schedule_screen()
-                    record_event("outside_schedule")
+                    start = self.config["schedule"]["allowed_start"]
+                    end = self.config["schedule"]["allowed_end"]
+                    record_event(
+                        "outside_schedule",
+                        f"Allowed: {start}-{end}",
+                        category="schedule_violation",
+                        block_reason=f"Outside allowed hours ({start}-{end})",
+                    )
                     time.sleep(60)
                     continue
 
@@ -615,7 +762,12 @@ class KioskManager:
                     if self.is_firefox_running():
                         self.stop_firefox()
                     self.show_times_up_screen()
-                    record_event("time_limit_reached", f"{today_usage // 60} minutes used")
+                    record_event(
+                        "time_limit_reached",
+                        f"{today_usage // 60} minutes used",
+                        category="time_exceeded",
+                        block_reason=f"Daily limit of {self.config['daily_limit_minutes']} minutes reached",
+                    )
                     time.sleep(60)
                     continue
 
@@ -708,6 +860,31 @@ DASHBOARD_HTML: str = """<!DOCTYPE html>
   .event-type.firefox_stop { background: #fdd; color: #c00; }
   .event-type.time_limit_reached { background: #fff3cd; color: #856404; }
   .event-type.kiosk_start { background: #d1ecf1; color: #0c5460; }
+  .event-type.app_blocked { background: #fdd; color: #c00; }
+  .event-type.site_blocked { background: #ffe0cc; color: #b35900; }
+  .event-type.outside_schedule { background: #e8d5f5; color: #6a1b9a; }
+  .security-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 12px; margin-bottom: 16px; }
+  .sec-stat { text-align: center; padding: 16px; background: #f5f5f7; border-radius: 10px; }
+  .sec-stat .icon { font-size: 24px; margin-bottom: 4px; }
+  .sec-stat .count { font-size: 28px; font-weight: 700; }
+  .sec-stat .label { font-size: 12px; color: #6e6e73; margin-top: 2px; }
+  .sec-stat.app_blocked { border-left: 4px solid #ff3b30; }
+  .sec-stat.site_blocked { border-left: 4px solid #ff9500; }
+  .sec-stat.schedule_violation { border-left: 4px solid #af52de; }
+  .sec-stat.time_exceeded { border-left: 4px solid #ffcc00; }
+  .block-feed-item { display: flex; align-items: center; gap: 10px; padding: 8px 0; border-bottom: 1px solid #e5e5ea; }
+  .block-feed-item:last-child { border-bottom: none; }
+  .block-feed-item .icon { font-size: 20px; flex-shrink: 0; }
+  .block-feed-item .info { flex: 1; }
+  .block-feed-item .info .name { font-weight: 600; font-size: 14px; }
+  .block-feed-item .info .reason { font-size: 12px; color: #6e6e73; }
+  .block-feed-item .time { font-size: 12px; color: #8e8e93; white-space: nowrap; }
+  .most-blocked-item { display: flex; align-items: center; gap: 10px; padding: 6px 0; }
+  .most-blocked-item .rank { font-weight: 700; color: #6e6e73; width: 20px; }
+  .most-blocked-item .name { flex: 1; font-size: 14px; }
+  .most-blocked-item .count { font-weight: 600; color: #ff3b30; }
+  .sec-columns { display: grid; grid-template-columns: 2fr 1fr; gap: 16px; }
+  @media (max-width: 600px) { .sec-columns { grid-template-columns: 1fr; } }
   #login { max-width: 300px; margin: 100px auto; }
 </style>
 </head>
@@ -744,8 +921,8 @@ function showLogin() {
 
 async function render() {
   if (!token) return showLogin();
-  const [status, config, history, events] = await Promise.all([
-    api('/status'), api('/config'), api('/history'), api('/events')
+  const [status, config, history, events, blocked] = await Promise.all([
+    api('/status'), api('/config'), api('/history'), api('/events'), api('/blocked')
   ]);
   if (status.error === 'unauthorized') { token = ''; sessionStorage.removeItem('kidsafe_token'); return showLogin(); }
 
@@ -790,6 +967,62 @@ async function render() {
       <div class="form-row" style="margin-top:12px">
         <input type="text" id="newsite" placeholder="example.com">
         <button onclick="addSite()">Add</button>
+      </div>
+    </div>
+
+    <h2>Security</h2>
+    <div class="card">
+      <div class="security-grid">
+        <div class="sec-stat app_blocked">
+          <div class="icon">&#128683;</div>
+          <div class="count">${blocked.counts.app_blocked || 0}</div>
+          <div class="label">Apps Blocked</div>
+        </div>
+        <div class="sec-stat site_blocked">
+          <div class="icon">&#127760;</div>
+          <div class="count">${blocked.counts.site_blocked || 0}</div>
+          <div class="label">Sites Blocked</div>
+        </div>
+        <div class="sec-stat schedule_violation">
+          <div class="icon">&#128347;</div>
+          <div class="count">${blocked.counts.schedule_violation || 0}</div>
+          <div class="label">Schedule Violations</div>
+        </div>
+        <div class="sec-stat time_exceeded">
+          <div class="icon">&#9200;</div>
+          <div class="count">${blocked.counts.time_exceeded || 0}</div>
+          <div class="label">Time Limit Hits</div>
+        </div>
+      </div>
+
+      <div class="sec-columns">
+        <div>
+          <h3 style="font-size:15px;margin-bottom:8px">Recent Blocked Activity</h3>
+          ${(blocked.events || []).length === 0 ? '<p style="color:#6e6e73;font-size:14px">No blocked events yet.</p>' :
+            (blocked.events || []).slice(0, 10).map(e => {
+              const icons = {app_blocked:'&#128683;', site_blocked:'&#127760;', schedule_violation:'&#128347;', time_exceeded:'&#9200;'};
+              const icon = icons[e.category] || '&#128275;';
+              const name = e.blocked_name || e.blocked_domain || e.detail || e.category;
+              return '<div class="block-feed-item">' +
+                '<div class="icon">' + icon + '</div>' +
+                '<div class="info"><div class="name">' + name + '</div>' +
+                '<div class="reason">' + (e.block_reason || e.category || '') + '</div></div>' +
+                '<div class="time">' + new Date(e.time).toLocaleString() + '</div></div>';
+            }).join('')}
+        </div>
+        <div>
+          <h3 style="font-size:15px;margin-bottom:8px">Most Blocked</h3>
+          ${(blocked.most_blocked || []).length === 0 ? '<p style="color:#6e6e73;font-size:14px">No data yet.</p>' :
+            (blocked.most_blocked || []).map((m, i) => {
+              const icons = {app_blocked:'&#128683;', site_blocked:'&#127760;', schedule_violation:'&#128347;', time_exceeded:'&#9200;'};
+              const icon = icons[m.category] || '&#128275;';
+              return '<div class="most-blocked-item">' +
+                '<div class="rank">' + (i + 1) + '</div>' +
+                '<div class="icon" style="font-size:16px">' + icon + '</div>' +
+                '<div class="name">' + m.name + '</div>' +
+                '<div class="count">' + m.count + 'x</div></div>';
+            }).join('')}
+        </div>
       </div>
     </div>
 
@@ -913,6 +1146,17 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self.send_json(get_usage_history())
         elif self.path == "/api/events":
             self.send_json(get_recent_events())
+        elif self.path.startswith("/api/blocked"):
+            query = parse_qs(urlparse(self.path).query)
+            block_type = query.get("type", [""])[0]
+            start_date = query.get("start", [""])[0]
+            end_date = query.get("end", [""])[0]
+            limit_str = query.get("limit", ["100"])[0]
+            try:
+                limit_val = int(limit_str)
+            except ValueError:
+                limit_val = 100
+            self.send_json(get_blocked_events(block_type, start_date, end_date, limit_val))
         else:
             self.send_json({"error": "not found"}, 404)
 
