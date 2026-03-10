@@ -25,11 +25,12 @@ import time
 import threading
 import hashlib
 import secrets
+import re
 from datetime import datetime, timedelta
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
+from typing import Any, Dict, List, Optional, Set
 from types import FrameType
-from typing import Any, Callable, Dict, List, Optional, Set
 from urllib.parse import parse_qs, urlparse
 
 # --- Configuration ---
@@ -230,7 +231,7 @@ def hash_password(password: str) -> str:
     return f"{salt}:{hashed}"
 
 
-def verify_password(password: str, stored: Optional[str]) -> bool:
+def verify_password(password: str, stored: str) -> bool:
     """Verify a password against stored hash."""
     if not stored:
         return False
@@ -246,7 +247,7 @@ FIREFOX_POLICY_FILE: Path = FIREFOX_POLICY_DIR / "policies.json"
 
 def generate_firefox_policies(config: Dict[str, Any]) -> Dict[str, Any]:
     """Generate Firefox enterprise policies for content filtering."""
-    dns_url = config["dns_providers"].get(
+    dns_url: str = config["dns_providers"].get(
         config["dns_provider"],
         config["dns_providers"]["cleanbrowsing"]
     )
@@ -328,7 +329,7 @@ def generate_firefox_policies(config: Dict[str, Any]) -> Dict[str, Any]:
     if config.get("allowed_sites"):
         # Block everything, then allow specific sites
         web_filter: Dict[str, List[str]] = {"Block": ["*"]}
-        exceptions: List[str] = [f"*://*.{site}/*" for site in config["allowed_sites"]]
+        exceptions = [f"*://*.{site}/*" for site in config["allowed_sites"]]
         # Also allow the homepage domain
         homepage_domain = urlparse(config["homepage"]).netloc
         if homepage_domain:
@@ -341,7 +342,7 @@ def generate_firefox_policies(config: Dict[str, Any]) -> Dict[str, Any]:
     if config.get("blocked_sites"):
         if "WebsiteFilter" not in policies["policies"]:
             policies["policies"]["WebsiteFilter"] = {}
-        block_patterns: List[str] = [f"*://*.{site}/*" for site in config["blocked_sites"]]
+        block_patterns = [f"*://*.{site}/*" for site in config["blocked_sites"]]
         policies["policies"]["WebsiteFilter"]["Block"] = block_patterns
 
     return policies
@@ -366,8 +367,6 @@ def apply_firefox_policies(config: Dict[str, Any]) -> bool:
 
 # --- App Enforcer (kills unauthorized apps) ---
 # Uses `ps` to find running .app processes — no Accessibility permissions needed.
-
-import re
 
 # .app bundles that are allowed to run (lowercase). Everything else from
 # /Applications/ or /System/Applications/ gets killed.
@@ -408,7 +407,7 @@ def find_unauthorized_apps() -> Dict[str, List[int]]:
 
 def kill_unauthorized_apps() -> List[str]:
     """Kill all unauthorized .app processes. Returns list of app names killed."""
-    apps: Dict[str, List[int]] = find_unauthorized_apps()
+    apps = find_unauthorized_apps()
     killed: List[str] = []
     for app_name, pids in apps.items():
         for pid in pids:
@@ -423,14 +422,10 @@ def kill_unauthorized_apps() -> List[str]:
 class AppEnforcer:
     """Background thread that continuously kills unauthorized apps."""
 
-    check_interval: int
-    running: bool
-    thread: Optional[threading.Thread]
-
     def __init__(self, check_interval: int = 2) -> None:
-        self.check_interval = check_interval
-        self.running = False
-        self.thread = None
+        self.check_interval: int = check_interval
+        self.running: bool = False
+        self.thread: Optional[threading.Thread] = None
 
     def start(self) -> None:
         self.running = True
@@ -458,35 +453,28 @@ class AppEnforcer:
 class KioskManager:
     """Manages Firefox in kiosk mode with time limits."""
 
-    config: Dict[str, Any]
-    firefox_process: Optional[subprocess.Popen[bytes]]
-    session_start: Optional[datetime]
-    running: bool
-    session_seconds: int
-    enforcer: AppEnforcer
-
     def __init__(self, config: Dict[str, Any]) -> None:
-        self.config = config
-        self.firefox_process = None
-        self.session_start = None
-        self.running = False
-        self.session_seconds = 0
-        self.enforcer = AppEnforcer(check_interval=2)
+        self.config: Dict[str, Any] = config
+        self.firefox_process: Optional[subprocess.Popen[bytes]] = None
+        self.session_start: Optional[datetime] = None
+        self.running: bool = False
+        self.session_seconds: int = 0
+        self.enforcer: AppEnforcer = AppEnforcer(check_interval=2)
 
     def is_within_schedule(self) -> bool:
         """Check if current time is within allowed schedule."""
         if not self.config["schedule"]["enabled"]:
             return True
-        now: str = datetime.now().strftime("%H:%M")
+        now = datetime.now().strftime("%H:%M")
         start: str = self.config["schedule"]["allowed_start"]
         end: str = self.config["schedule"]["allowed_end"]
-        return bool(start <= now <= end)
+        return start <= now <= end
 
     def get_remaining_minutes(self) -> int:
         """Get remaining minutes for today."""
-        used: int = get_today_usage()
-        limit: int = int(self.config["daily_limit_minutes"]) * 60
-        remaining: int = max(0, limit - used)
+        used = get_today_usage()
+        limit: int = self.config["daily_limit_minutes"] * 60
+        remaining = max(0, limit - used)
         return remaining // 60
 
     def hide_dock(self) -> None:
@@ -522,7 +510,7 @@ class KioskManager:
 
     def launch_firefox(self) -> bool:
         """Launch Firefox in kiosk mode."""
-        cmd: List[str] = ["/Applications/Firefox.app/Contents/MacOS/firefox"]
+        cmd = ["/Applications/Firefox.app/Contents/MacOS/firefox"]
         if self.config["firefox_kiosk"]:
             cmd.append("--kiosk")
         cmd.append(self.config["homepage"])
@@ -587,8 +575,8 @@ class KioskManager:
 
     def show_outside_schedule_screen(self) -> None:
         """Show an 'Outside Schedule' dialog."""
-        start: str = self.config["schedule"]["allowed_start"]
-        end: str = self.config["schedule"]["allowed_end"]
+        start = self.config["schedule"]["allowed_start"]
+        end = self.config["schedule"]["allowed_end"]
         try:
             subprocess.run([
                 "osascript", "-e",
@@ -676,7 +664,7 @@ class KioskManager:
 
 # --- Parent Dashboard Web Server ---
 
-DASHBOARD_HTML = """<!DOCTYPE html>
+DASHBOARD_HTML: str = """<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
@@ -879,7 +867,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
     kiosk: Optional[KioskManager] = None
     auth_tokens: Set[str] = set()
 
-    def log_message(self, format: str, *args: Any) -> None:
+    def log_message(self, format: str, *args: object) -> None:
         """Suppress default HTTP logging."""
         pass
 
@@ -907,21 +895,19 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self.send_json({"error": "unauthorized"}, 401)
             return
 
-        config = DashboardHandler.config
-        assert config is not None
-
+        assert DashboardHandler.config is not None
         if self.path == "/api/status":
-            used: int = get_today_usage()
-            limit: int = config["daily_limit_minutes"] * 60
+            used = get_today_usage()
+            limit = DashboardHandler.config["daily_limit_minutes"] * 60
             self.send_json({
                 "used_minutes": used // 60,
                 "remaining_minutes": max(0, (limit - used)) // 60,
-                "limit_minutes": config["daily_limit_minutes"],
+                "limit_minutes": DashboardHandler.config["daily_limit_minutes"],
                 "firefox_running": DashboardHandler.kiosk.is_firefox_running() if DashboardHandler.kiosk else False,
                 "within_schedule": DashboardHandler.kiosk.is_within_schedule() if DashboardHandler.kiosk else True
             })
         elif self.path == "/api/config":
-            safe_config: Dict[str, Any] = {k: v for k, v in config.items() if k != "admin_password_hash"}
+            safe_config = {k: v for k, v in DashboardHandler.config.items() if k != "admin_password_hash"}
             self.send_json(safe_config)
         elif self.path == "/api/history":
             self.send_json(get_usage_history())
@@ -931,16 +917,14 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self.send_json({"error": "not found"}, 404)
 
     def do_POST(self) -> None:
-        content_length: int = int(self.headers.get("Content-Length", 0))
+        assert DashboardHandler.config is not None
+        content_length = int(self.headers.get("Content-Length", "0"))
         body: Dict[str, Any] = json.loads(self.rfile.read(content_length)) if content_length > 0 else {}
-
-        config = DashboardHandler.config
-        assert config is not None
 
         if self.path == "/api/login":
             password: str = body.get("password", "")
-            if verify_password(password, config.get("admin_password_hash")):
-                token: str = secrets.token_hex(32)
+            if verify_password(password, DashboardHandler.config.get("admin_password_hash", "")):
+                token = secrets.token_hex(32)
                 DashboardHandler.auth_tokens.add(token)
                 self.send_json({"token": token})
             else:
@@ -952,8 +936,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
             return
 
         if self.path == "/api/config":
-            config.update(body)
-            save_config(config)
+            DashboardHandler.config.update(body)
+            save_config(DashboardHandler.config)
             record_event("config_update", json.dumps(body))
             self.send_json({"ok": True})
         elif self.path == "/api/reset-time":
@@ -961,7 +945,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
             record_event("time_reset", "Admin reset daily time")
             self.send_json({"ok": True})
         elif self.path == "/api/apply-policies":
-            ok: bool = apply_firefox_policies(config)
+            ok = apply_firefox_policies(DashboardHandler.config)
             self.send_json({"ok": ok, "message": "Policies applied" if ok else "Failed — need admin permissions"})
         elif self.path == "/api/stop-kiosk":
             if DashboardHandler.kiosk:
@@ -1147,7 +1131,7 @@ def main() -> None:
         print("  policies  Apply Firefox policies")
         sys.exit(0)
 
-    commands: Dict[str, Callable[[List[str]], None]] = {
+    commands = {
         "setup": cmd_setup,
         "start": cmd_start,
         "stop": cmd_stop,
@@ -1156,7 +1140,7 @@ def main() -> None:
         "policies": cmd_policies,
     }
 
-    cmd: str = sys.argv[1]
+    cmd = sys.argv[1]
     if cmd in commands:
         commands[cmd](sys.argv[2:])
     else:
