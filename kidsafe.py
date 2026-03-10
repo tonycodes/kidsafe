@@ -13,6 +13,8 @@ Locks a macOS user account to Firefox-only browsing with:
 Designed for macOS 11+ (Big Sur), Python 3.8+, zero dependencies.
 """
 
+from __future__ import annotations
+
 import json
 import os
 import signal
@@ -23,19 +25,22 @@ import time
 import threading
 import hashlib
 import secrets
+import re
 from datetime import datetime, timedelta
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
+from typing import Any, Dict, List, Optional, Set
+from types import FrameType
 from urllib.parse import parse_qs, urlparse
 
 # --- Configuration ---
 
-CONFIG_DIR = Path.home() / ".kidsafe"
-CONFIG_FILE = CONFIG_DIR / "config.json"
-DB_FILE = CONFIG_DIR / "activity.db"
-LOG_FILE = CONFIG_DIR / "kidsafe.log"
+CONFIG_DIR: Path = Path.home() / ".kidsafe"
+CONFIG_FILE: Path = CONFIG_DIR / "config.json"
+DB_FILE: Path = CONFIG_DIR / "activity.db"
+LOG_FILE: Path = CONFIG_DIR / "kidsafe.log"
 
-DEFAULT_CONFIG = {
+DEFAULT_CONFIG: Dict[str, Any] = {
     "child_user": "emilio",
     "admin_password_hash": "",
     "admin_port": 8484,
@@ -78,7 +83,7 @@ DEFAULT_CONFIG = {
 }
 
 
-def log(msg):
+def log(msg: str) -> None:
     """Simple logging to file and stdout."""
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     line = f"[{timestamp}] {msg}"
@@ -92,7 +97,7 @@ def log(msg):
 
 # --- Database ---
 
-def init_db():
+def init_db() -> None:
     """Initialize SQLite database for activity tracking."""
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(str(DB_FILE))
@@ -115,20 +120,55 @@ def init_db():
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             timestamp TEXT NOT NULL,
             event_type TEXT NOT NULL,
-            detail TEXT
+            detail TEXT,
+            category TEXT,
+            blocked_name TEXT,
+            blocked_domain TEXT,
+            block_reason TEXT
         )
+    """)
+    # Add enriched columns to existing databases (safe to run multiple times)
+    for col, col_type in [
+        ("category", "TEXT"),
+        ("blocked_name", "TEXT"),
+        ("blocked_domain", "TEXT"),
+        ("block_reason", "TEXT"),
+    ]:
+        try:
+            conn.execute(f"ALTER TABLE events ADD COLUMN {col} {col_type}")
+        except sqlite3.OperationalError:
+            pass  # Column already exists
+    conn.execute("""
+        CREATE INDEX IF NOT EXISTS idx_events_category ON events (category)
     """)
     conn.commit()
     conn.close()
 
 
-def record_event(event_type, detail=""):
-    """Record an event to the database."""
+def record_event(
+    event_type: str,
+    detail: str = "",
+    category: str = "",
+    blocked_name: str = "",
+    blocked_domain: str = "",
+    block_reason: str = "",
+) -> None:
+    """Record an event to the database with optional enriched block detail."""
     try:
         conn = sqlite3.connect(str(DB_FILE))
         conn.execute(
-            "INSERT INTO events (timestamp, event_type, detail) VALUES (?, ?, ?)",
-            (datetime.now().isoformat(), event_type, detail)
+            "INSERT INTO events (timestamp, event_type, detail, category, "
+            "blocked_name, blocked_domain, block_reason) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (
+                datetime.now().isoformat(),
+                event_type,
+                detail,
+                category or None,
+                blocked_name or None,
+                blocked_domain or None,
+                block_reason or None,
+            ),
         )
         conn.commit()
         conn.close()
@@ -136,7 +176,7 @@ def record_event(event_type, detail=""):
         log(f"DB error: {e}")
 
 
-def get_today_usage():
+def get_today_usage() -> int:
     """Get total usage seconds for today."""
     try:
         conn = sqlite3.connect(str(DB_FILE))
@@ -150,7 +190,7 @@ def get_today_usage():
         return 0
 
 
-def update_daily_usage(seconds):
+def update_daily_usage(seconds: int) -> None:
     """Update today's usage total."""
     try:
         conn = sqlite3.connect(str(DB_FILE))
@@ -165,7 +205,7 @@ def update_daily_usage(seconds):
         log(f"DB error: {e}")
 
 
-def get_usage_history(days=7):
+def get_usage_history(days: int = 7) -> List[Dict[str, Any]]:
     """Get usage history for the last N days."""
     try:
         conn = sqlite3.connect(str(DB_FILE))
@@ -180,28 +220,118 @@ def get_usage_history(days=7):
         return []
 
 
-def get_recent_events(limit=50):
+def get_recent_events(limit: int = 50) -> List[Dict[str, Any]]:
     """Get recent events."""
     try:
         conn = sqlite3.connect(str(DB_FILE))
         rows = conn.execute(
-            "SELECT timestamp, event_type, detail FROM events ORDER BY id DESC LIMIT ?",
+            "SELECT timestamp, event_type, detail, category, blocked_name, "
+            "blocked_domain, block_reason FROM events ORDER BY id DESC LIMIT ?",
             (limit,)
         ).fetchall()
         conn.close()
-        return [{"time": r[0], "type": r[1], "detail": r[2]} for r in rows]
+        return [
+            {
+                "time": r[0], "type": r[1], "detail": r[2],
+                "category": r[3], "blocked_name": r[4],
+                "blocked_domain": r[5], "block_reason": r[6],
+            }
+            for r in rows
+        ]
     except Exception:
         return []
 
 
+def get_blocked_events(
+    block_type: str = "",
+    start_date: str = "",
+    end_date: str = "",
+    limit: int = 100,
+) -> Dict[str, Any]:
+    """Get blocked events with filtering, counts, and most-blocked summary."""
+    try:
+        conn = sqlite3.connect(str(DB_FILE))
+        where_clauses = ["category IS NOT NULL"]
+        params: List[Any] = []
+
+        if block_type:
+            where_clauses.append("category = ?")
+            params.append(block_type)
+        if start_date:
+            where_clauses.append("timestamp >= ?")
+            params.append(start_date)
+        if end_date:
+            where_clauses.append("timestamp <= ?")
+            params.append(end_date + "T23:59:59")
+
+        where_sql = " AND ".join(where_clauses)
+
+        # Filtered events
+        rows = conn.execute(
+            f"SELECT timestamp, event_type, detail, category, blocked_name, "
+            f"blocked_domain, block_reason FROM events "
+            f"WHERE {where_sql} ORDER BY id DESC LIMIT ?",
+            params + [limit],
+        ).fetchall()
+
+        events = [
+            {
+                "time": r[0], "type": r[1], "detail": r[2],
+                "category": r[3], "blocked_name": r[4],
+                "blocked_domain": r[5], "block_reason": r[6],
+            }
+            for r in rows
+        ]
+
+        # Counts by category (ignoring type/date filters for summary)
+        count_where = "category IS NOT NULL"
+        count_params: List[Any] = []
+        if start_date:
+            count_where += " AND timestamp >= ?"
+            count_params.append(start_date)
+        if end_date:
+            count_where += " AND timestamp <= ?"
+            count_params.append(end_date + "T23:59:59")
+
+        count_rows = conn.execute(
+            f"SELECT category, COUNT(*) FROM events "
+            f"WHERE {count_where} GROUP BY category",
+            count_params,
+        ).fetchall()
+        counts = {r[0]: r[1] for r in count_rows}
+
+        # Top 5 most blocked apps/sites
+        top_rows = conn.execute(
+            f"SELECT COALESCE(blocked_name, blocked_domain, detail) as name, "
+            f"category, COUNT(*) as cnt FROM events "
+            f"WHERE {count_where} AND "
+            f"COALESCE(blocked_name, blocked_domain, detail) IS NOT NULL "
+            f"GROUP BY name, category ORDER BY cnt DESC LIMIT 5",
+            count_params,
+        ).fetchall()
+        most_blocked = [
+            {"name": r[0], "category": r[1], "count": r[2]} for r in top_rows
+        ]
+
+        conn.close()
+        return {
+            "events": events,
+            "counts": counts,
+            "most_blocked": most_blocked,
+            "total": sum(counts.values()),
+        }
+    except Exception:
+        return {"events": [], "counts": {}, "most_blocked": [], "total": 0}
+
+
 # --- Config ---
 
-def load_config():
+def load_config() -> Dict[str, Any]:
     """Load config from file, creating defaults if needed."""
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
     if CONFIG_FILE.exists():
         with open(CONFIG_FILE) as f:
-            config = json.load(f)
+            config: Dict[str, Any] = json.load(f)
         # Merge any new default keys
         for key, val in DEFAULT_CONFIG.items():
             if key not in config:
@@ -212,21 +342,21 @@ def load_config():
         return DEFAULT_CONFIG.copy()
 
 
-def save_config(config):
+def save_config(config: Dict[str, Any]) -> None:
     """Save config to file."""
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
     with open(CONFIG_FILE, "w") as f:
         json.dump(config, f, indent=2)
 
 
-def hash_password(password):
+def hash_password(password: str) -> str:
     """Hash a password with a salt."""
     salt = secrets.token_hex(16)
     hashed = hashlib.sha256((salt + password).encode()).hexdigest()
     return f"{salt}:{hashed}"
 
 
-def verify_password(password, stored):
+def verify_password(password: str, stored: str) -> bool:
     """Verify a password against stored hash."""
     if not stored:
         return False
@@ -236,18 +366,18 @@ def verify_password(password, stored):
 
 # --- Firefox Policy Management ---
 
-FIREFOX_POLICY_DIR = Path("/Applications/Firefox.app/Contents/Resources/distribution")
-FIREFOX_POLICY_FILE = FIREFOX_POLICY_DIR / "policies.json"
+FIREFOX_POLICY_DIR: Path = Path("/Applications/Firefox.app/Contents/Resources/distribution")
+FIREFOX_POLICY_FILE: Path = FIREFOX_POLICY_DIR / "policies.json"
 
 
-def generate_firefox_policies(config):
+def generate_firefox_policies(config: Dict[str, Any]) -> Dict[str, Any]:
     """Generate Firefox enterprise policies for content filtering."""
-    dns_url = config["dns_providers"].get(
+    dns_url: str = config["dns_providers"].get(
         config["dns_provider"],
         config["dns_providers"]["cleanbrowsing"]
     )
 
-    policies = {
+    policies: Dict[str, Any] = {
         "policies": {
             # Force DNS-over-HTTPS with family filter
             "DNSOverHTTPS": {
@@ -308,7 +438,7 @@ def generate_firefox_policies(config):
     }
 
     # Add bookmarks for allowed sites
-    toolbar_bookmarks = []
+    toolbar_bookmarks: List[Dict[str, str]] = []
     for site in config["allowed_sites"][:10]:
         name = site.split(".")[0].replace("/", " ").title()
         toolbar_bookmarks.append({
@@ -323,7 +453,7 @@ def generate_firefox_policies(config):
     # Website filter (whitelist mode if allowed_sites is set)
     if config.get("allowed_sites"):
         # Block everything, then allow specific sites
-        web_filter = {"Block": ["*"]}
+        web_filter: Dict[str, List[str]] = {"Block": ["*"]}
         exceptions = [f"*://*.{site}/*" for site in config["allowed_sites"]]
         # Also allow the homepage domain
         homepage_domain = urlparse(config["homepage"]).netloc
@@ -343,7 +473,7 @@ def generate_firefox_policies(config):
     return policies
 
 
-def apply_firefox_policies(config):
+def apply_firefox_policies(config: Dict[str, Any]) -> bool:
     """Write Firefox enterprise policies to disk."""
     policies = generate_firefox_policies(config)
     try:
@@ -352,6 +482,15 @@ def apply_firefox_policies(config):
             json.dump(policies, f, indent=2)
         log("Firefox policies applied")
         record_event("policy_update", "Firefox policies updated")
+        # Log each explicitly blocked site
+        for site in config.get("blocked_sites", []):
+            record_event(
+                "site_blocked",
+                site,
+                category="site_blocked",
+                blocked_domain=site,
+                block_reason="Site in blocklist",
+            )
         return True
     except PermissionError:
         log("ERROR: Cannot write Firefox policies — need admin permissions")
@@ -363,16 +502,14 @@ def apply_firefox_policies(config):
 # --- App Enforcer (kills unauthorized apps) ---
 # Uses `ps` to find running .app processes — no Accessibility permissions needed.
 
-import re
-
 # .app bundles that are allowed to run (lowercase). Everything else from
 # /Applications/ or /System/Applications/ gets killed.
-ALLOWED_APP_BUNDLES = {
+ALLOWED_APP_BUNDLES: Set[str] = {
     "firefox.app",
 }
 
 
-def find_unauthorized_apps():
+def find_unauthorized_apps() -> Dict[str, List[int]]:
     """Find running .app processes that aren't in the allowed list.
     Returns dict of {app_name: [pids]} for apps that should be killed.
     No special permissions required — just reads `ps` output."""
@@ -384,7 +521,7 @@ def find_unauthorized_apps():
     except Exception:
         return {}
 
-    apps = {}  # {app_name: [pids]}
+    apps: Dict[str, List[int]] = {}  # {app_name: [pids]}
     for line in result.stdout.strip().split("\n")[1:]:
         parts = line.strip().split(None, 1)
         if len(parts) < 2:
@@ -402,10 +539,10 @@ def find_unauthorized_apps():
     return apps
 
 
-def kill_unauthorized_apps():
+def kill_unauthorized_apps() -> List[str]:
     """Kill all unauthorized .app processes. Returns list of app names killed."""
     apps = find_unauthorized_apps()
-    killed = []
+    killed: List[str] = []
     for app_name, pids in apps.items():
         for pid in pids:
             try:
@@ -419,27 +556,33 @@ def kill_unauthorized_apps():
 class AppEnforcer:
     """Background thread that continuously kills unauthorized apps."""
 
-    def __init__(self, check_interval=2):
-        self.check_interval = check_interval
-        self.running = False
-        self.thread = None
+    def __init__(self, check_interval: int = 2) -> None:
+        self.check_interval: int = check_interval
+        self.running: bool = False
+        self.thread: Optional[threading.Thread] = None
 
-    def start(self):
+    def start(self) -> None:
         self.running = True
         self.thread = threading.Thread(target=self._run, daemon=True)
         self.thread.start()
         log("App enforcer started — unauthorized apps will be killed")
 
-    def stop(self):
+    def stop(self) -> None:
         self.running = False
 
-    def _run(self):
+    def _run(self) -> None:
         while self.running:
             try:
                 killed = kill_unauthorized_apps()
                 for app in killed:
                     log(f"Killed unauthorized app: {app}")
-                    record_event("app_blocked", app)
+                    record_event(
+                        "app_blocked",
+                        app,
+                        category="app_blocked",
+                        blocked_name=app,
+                        block_reason="App not in whitelist",
+                    )
             except Exception as e:
                 log(f"Enforcer error: {e}")
             time.sleep(self.check_interval)
@@ -450,29 +593,31 @@ class AppEnforcer:
 class KioskManager:
     """Manages Firefox in kiosk mode with time limits."""
 
-    def __init__(self, config):
-        self.config = config
-        self.firefox_process = None
-        self.session_start = None
-        self.running = False
-        self.session_seconds = 0
-        self.enforcer = AppEnforcer(check_interval=2)
+    def __init__(self, config: Dict[str, Any]) -> None:
+        self.config: Dict[str, Any] = config
+        self.firefox_process: Optional[subprocess.Popen[bytes]] = None
+        self.session_start: Optional[datetime] = None
+        self.running: bool = False
+        self.session_seconds: int = 0
+        self.enforcer: AppEnforcer = AppEnforcer(check_interval=2)
 
-    def is_within_schedule(self):
+    def is_within_schedule(self) -> bool:
         """Check if current time is within allowed schedule."""
         if not self.config["schedule"]["enabled"]:
             return True
         now = datetime.now().strftime("%H:%M")
-        return self.config["schedule"]["allowed_start"] <= now <= self.config["schedule"]["allowed_end"]
+        start: str = self.config["schedule"]["allowed_start"]
+        end: str = self.config["schedule"]["allowed_end"]
+        return start <= now <= end
 
-    def get_remaining_minutes(self):
+    def get_remaining_minutes(self) -> int:
         """Get remaining minutes for today."""
         used = get_today_usage()
-        limit = self.config["daily_limit_minutes"] * 60
+        limit: int = self.config["daily_limit_minutes"] * 60
         remaining = max(0, limit - used)
         return remaining // 60
 
-    def hide_dock(self):
+    def hide_dock(self) -> None:
         """Auto-hide the Dock so the child only sees Firefox."""
         try:
             subprocess.run(
@@ -483,7 +628,7 @@ class KioskManager:
         except Exception:
             pass
 
-    def ensure_firefox_fullscreen(self):
+    def ensure_firefox_fullscreen(self) -> None:
         """Make sure Firefox is in fullscreen. Sends Cmd+Shift+F if not."""
         try:
             # Check if Firefox has a fullscreen window
@@ -503,7 +648,7 @@ class KioskManager:
         except Exception:
             pass
 
-    def launch_firefox(self):
+    def launch_firefox(self) -> bool:
         """Launch Firefox in kiosk mode."""
         cmd = ["/Applications/Firefox.app/Contents/MacOS/firefox"]
         if self.config["firefox_kiosk"]:
@@ -526,7 +671,7 @@ class KioskManager:
             log(f"Failed to launch Firefox: {e}")
             return False
 
-    def stop_firefox(self):
+    def stop_firefox(self) -> None:
         """Stop Firefox gracefully."""
         if self.firefox_process:
             try:
@@ -540,13 +685,13 @@ class KioskManager:
             log("Firefox stopped")
             record_event("firefox_stop")
 
-    def is_firefox_running(self):
+    def is_firefox_running(self) -> bool:
         """Check if Firefox process is still running."""
         if self.firefox_process:
             return self.firefox_process.poll() is None
         return False
 
-    def show_notification(self, title, message):
+    def show_notification(self, title: str, message: str) -> None:
         """Show a macOS notification."""
         try:
             subprocess.run([
@@ -556,7 +701,7 @@ class KioskManager:
         except Exception:
             pass
 
-    def show_times_up_screen(self):
+    def show_times_up_screen(self) -> None:
         """Show a 'Time's Up' dialog."""
         try:
             subprocess.run([
@@ -568,7 +713,7 @@ class KioskManager:
         except Exception:
             pass
 
-    def show_outside_schedule_screen(self):
+    def show_outside_schedule_screen(self) -> None:
         """Show an 'Outside Schedule' dialog."""
         start = self.config["schedule"]["allowed_start"]
         end = self.config["schedule"]["allowed_end"]
@@ -582,7 +727,7 @@ class KioskManager:
         except Exception:
             pass
 
-    def run(self):
+    def run(self) -> None:
         """Main kiosk loop."""
         self.running = True
         log("KidSafe kiosk manager started")
@@ -598,7 +743,14 @@ class KioskManager:
                     if self.is_firefox_running():
                         self.stop_firefox()
                     self.show_outside_schedule_screen()
-                    record_event("outside_schedule")
+                    start = self.config["schedule"]["allowed_start"]
+                    end = self.config["schedule"]["allowed_end"]
+                    record_event(
+                        "outside_schedule",
+                        f"Allowed: {start}-{end}",
+                        category="schedule_violation",
+                        block_reason=f"Outside allowed hours ({start}-{end})",
+                    )
                     time.sleep(60)
                     continue
 
@@ -610,7 +762,12 @@ class KioskManager:
                     if self.is_firefox_running():
                         self.stop_firefox()
                     self.show_times_up_screen()
-                    record_event("time_limit_reached", f"{today_usage // 60} minutes used")
+                    record_event(
+                        "time_limit_reached",
+                        f"{today_usage // 60} minutes used",
+                        category="time_exceeded",
+                        block_reason=f"Daily limit of {self.config['daily_limit_minutes']} minutes reached",
+                    )
                     time.sleep(60)
                     continue
 
@@ -652,14 +809,14 @@ class KioskManager:
         record_event("kiosk_stop")
         log("KidSafe kiosk manager stopped")
 
-    def stop(self):
+    def stop(self) -> None:
         """Signal the kiosk to stop."""
         self.running = False
 
 
 # --- Parent Dashboard Web Server ---
 
-DASHBOARD_HTML = """<!DOCTYPE html>
+DASHBOARD_HTML: str = """<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
@@ -703,6 +860,31 @@ DASHBOARD_HTML = """<!DOCTYPE html>
   .event-type.firefox_stop { background: #fdd; color: #c00; }
   .event-type.time_limit_reached { background: #fff3cd; color: #856404; }
   .event-type.kiosk_start { background: #d1ecf1; color: #0c5460; }
+  .event-type.app_blocked { background: #fdd; color: #c00; }
+  .event-type.site_blocked { background: #ffe0cc; color: #b35900; }
+  .event-type.outside_schedule { background: #e8d5f5; color: #6a1b9a; }
+  .security-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 12px; margin-bottom: 16px; }
+  .sec-stat { text-align: center; padding: 16px; background: #f5f5f7; border-radius: 10px; }
+  .sec-stat .icon { font-size: 24px; margin-bottom: 4px; }
+  .sec-stat .count { font-size: 28px; font-weight: 700; }
+  .sec-stat .label { font-size: 12px; color: #6e6e73; margin-top: 2px; }
+  .sec-stat.app_blocked { border-left: 4px solid #ff3b30; }
+  .sec-stat.site_blocked { border-left: 4px solid #ff9500; }
+  .sec-stat.schedule_violation { border-left: 4px solid #af52de; }
+  .sec-stat.time_exceeded { border-left: 4px solid #ffcc00; }
+  .block-feed-item { display: flex; align-items: center; gap: 10px; padding: 8px 0; border-bottom: 1px solid #e5e5ea; }
+  .block-feed-item:last-child { border-bottom: none; }
+  .block-feed-item .icon { font-size: 20px; flex-shrink: 0; }
+  .block-feed-item .info { flex: 1; }
+  .block-feed-item .info .name { font-weight: 600; font-size: 14px; }
+  .block-feed-item .info .reason { font-size: 12px; color: #6e6e73; }
+  .block-feed-item .time { font-size: 12px; color: #8e8e93; white-space: nowrap; }
+  .most-blocked-item { display: flex; align-items: center; gap: 10px; padding: 6px 0; }
+  .most-blocked-item .rank { font-weight: 700; color: #6e6e73; width: 20px; }
+  .most-blocked-item .name { flex: 1; font-size: 14px; }
+  .most-blocked-item .count { font-weight: 600; color: #ff3b30; }
+  .sec-columns { display: grid; grid-template-columns: 2fr 1fr; gap: 16px; }
+  @media (max-width: 600px) { .sec-columns { grid-template-columns: 1fr; } }
   #login { max-width: 300px; margin: 100px auto; }
 </style>
 </head>
@@ -739,8 +921,8 @@ function showLogin() {
 
 async function render() {
   if (!token) return showLogin();
-  const [status, config, history, events] = await Promise.all([
-    api('/status'), api('/config'), api('/history'), api('/events')
+  const [status, config, history, events, blocked] = await Promise.all([
+    api('/status'), api('/config'), api('/history'), api('/events'), api('/blocked')
   ]);
   if (status.error === 'unauthorized') { token = ''; sessionStorage.removeItem('kidsafe_token'); return showLogin(); }
 
@@ -785,6 +967,62 @@ async function render() {
       <div class="form-row" style="margin-top:12px">
         <input type="text" id="newsite" placeholder="example.com">
         <button onclick="addSite()">Add</button>
+      </div>
+    </div>
+
+    <h2>Security</h2>
+    <div class="card">
+      <div class="security-grid">
+        <div class="sec-stat app_blocked">
+          <div class="icon">&#128683;</div>
+          <div class="count">${blocked.counts.app_blocked || 0}</div>
+          <div class="label">Apps Blocked</div>
+        </div>
+        <div class="sec-stat site_blocked">
+          <div class="icon">&#127760;</div>
+          <div class="count">${blocked.counts.site_blocked || 0}</div>
+          <div class="label">Sites Blocked</div>
+        </div>
+        <div class="sec-stat schedule_violation">
+          <div class="icon">&#128347;</div>
+          <div class="count">${blocked.counts.schedule_violation || 0}</div>
+          <div class="label">Schedule Violations</div>
+        </div>
+        <div class="sec-stat time_exceeded">
+          <div class="icon">&#9200;</div>
+          <div class="count">${blocked.counts.time_exceeded || 0}</div>
+          <div class="label">Time Limit Hits</div>
+        </div>
+      </div>
+
+      <div class="sec-columns">
+        <div>
+          <h3 style="font-size:15px;margin-bottom:8px">Recent Blocked Activity</h3>
+          ${(blocked.events || []).length === 0 ? '<p style="color:#6e6e73;font-size:14px">No blocked events yet.</p>' :
+            (blocked.events || []).slice(0, 10).map(e => {
+              const icons = {app_blocked:'&#128683;', site_blocked:'&#127760;', schedule_violation:'&#128347;', time_exceeded:'&#9200;'};
+              const icon = icons[e.category] || '&#128275;';
+              const name = e.blocked_name || e.blocked_domain || e.detail || e.category;
+              return '<div class="block-feed-item">' +
+                '<div class="icon">' + icon + '</div>' +
+                '<div class="info"><div class="name">' + name + '</div>' +
+                '<div class="reason">' + (e.block_reason || e.category || '') + '</div></div>' +
+                '<div class="time">' + new Date(e.time).toLocaleString() + '</div></div>';
+            }).join('')}
+        </div>
+        <div>
+          <h3 style="font-size:15px;margin-bottom:8px">Most Blocked</h3>
+          ${(blocked.most_blocked || []).length === 0 ? '<p style="color:#6e6e73;font-size:14px">No data yet.</p>' :
+            (blocked.most_blocked || []).map((m, i) => {
+              const icons = {app_blocked:'&#128683;', site_blocked:'&#127760;', schedule_violation:'&#128347;', time_exceeded:'&#9200;'};
+              const icon = icons[m.category] || '&#128275;';
+              return '<div class="most-blocked-item">' +
+                '<div class="rank">' + (i + 1) + '</div>' +
+                '<div class="icon" style="font-size:16px">' + icon + '</div>' +
+                '<div class="name">' + m.name + '</div>' +
+                '<div class="count">' + m.count + 'x</div></div>';
+            }).join('')}
+        </div>
       </div>
     </div>
 
@@ -857,28 +1095,28 @@ setInterval(render, 30000);
 class DashboardHandler(BaseHTTPRequestHandler):
     """HTTP handler for the parent dashboard."""
 
-    server_version = "KidSafe/1.0"
-    config = None
-    kiosk = None
-    auth_tokens = set()
+    server_version: str = "KidSafe/1.0"
+    config: Optional[Dict[str, Any]] = None
+    kiosk: Optional[KioskManager] = None
+    auth_tokens: Set[str] = set()
 
-    def log_message(self, format, *args):
+    def log_message(self, format: str, *args: object) -> None:
         """Suppress default HTTP logging."""
         pass
 
-    def send_json(self, data, status=200):
+    def send_json(self, data: Any, status: int = 200) -> None:
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
         self.end_headers()
         self.wfile.write(json.dumps(data).encode())
 
-    def check_auth(self):
+    def check_auth(self) -> bool:
         auth = self.headers.get("Authorization", "")
         if auth.startswith("Bearer "):
             return auth[7:] in DashboardHandler.auth_tokens
         return False
 
-    def do_GET(self):
+    def do_GET(self) -> None:
         if self.path == "/" or self.path == "/dashboard":
             self.send_response(200)
             self.send_header("Content-Type", "text/html")
@@ -890,6 +1128,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self.send_json({"error": "unauthorized"}, 401)
             return
 
+        assert DashboardHandler.config is not None
         if self.path == "/api/status":
             used = get_today_usage()
             limit = DashboardHandler.config["daily_limit_minutes"] * 60
@@ -907,16 +1146,28 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self.send_json(get_usage_history())
         elif self.path == "/api/events":
             self.send_json(get_recent_events())
+        elif self.path.startswith("/api/blocked"):
+            query = parse_qs(urlparse(self.path).query)
+            block_type = query.get("type", [""])[0]
+            start_date = query.get("start", [""])[0]
+            end_date = query.get("end", [""])[0]
+            limit_str = query.get("limit", ["100"])[0]
+            try:
+                limit_val = int(limit_str)
+            except ValueError:
+                limit_val = 100
+            self.send_json(get_blocked_events(block_type, start_date, end_date, limit_val))
         else:
             self.send_json({"error": "not found"}, 404)
 
-    def do_POST(self):
-        content_length = int(self.headers.get("Content-Length", 0))
-        body = json.loads(self.rfile.read(content_length)) if content_length > 0 else {}
+    def do_POST(self) -> None:
+        assert DashboardHandler.config is not None
+        content_length = int(self.headers.get("Content-Length", "0"))
+        body: Dict[str, Any] = json.loads(self.rfile.read(content_length)) if content_length > 0 else {}
 
         if self.path == "/api/login":
-            password = body.get("password", "")
-            if verify_password(password, DashboardHandler.config.get("admin_password_hash")):
+            password: str = body.get("password", "")
+            if verify_password(password, DashboardHandler.config.get("admin_password_hash", "")):
                 token = secrets.token_hex(32)
                 DashboardHandler.auth_tokens.add(token)
                 self.send_json({"token": token})
@@ -948,7 +1199,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self.send_json({"error": "not found"}, 404)
 
 
-def run_dashboard(config, kiosk, port=8484):
+def run_dashboard(config: Dict[str, Any], kiosk: KioskManager, port: int = 8484) -> None:
     """Start the parent dashboard web server."""
     DashboardHandler.config = config
     DashboardHandler.kiosk = kiosk
@@ -959,10 +1210,10 @@ def run_dashboard(config, kiosk, port=8484):
 
 # --- CLI ---
 
-def cmd_setup(args):
+def cmd_setup(args: List[str]) -> None:
     """Interactive setup (or non-interactive with flags)."""
     # Parse flags for non-interactive mode
-    flags = {}
+    flags: Dict[str, str] = {}
     i = 0
     while i < len(args):
         if args[i] == "--child" and i + 1 < len(args):
@@ -1028,7 +1279,7 @@ def cmd_setup(args):
     print(f"Parent dashboard: http://127.0.0.1:{config['admin_port']}")
 
 
-def cmd_start(args):
+def cmd_start(args: List[str]) -> None:
     """Start the kiosk and dashboard."""
     config = load_config()
     init_db()
@@ -1050,7 +1301,7 @@ def cmd_start(args):
     dashboard_thread.start()
 
     # Handle SIGTERM gracefully
-    def handle_signal(signum, frame):
+    def handle_signal(signum: int, frame: Optional[FrameType]) -> None:
         log("Received shutdown signal")
         kiosk.stop()
 
@@ -1061,7 +1312,7 @@ def cmd_start(args):
     kiosk.run()
 
 
-def cmd_stop(args):
+def cmd_stop(args: List[str]) -> None:
     """Stop the kiosk by finding and killing the process."""
     try:
         result = subprocess.run(
@@ -1079,7 +1330,7 @@ def cmd_stop(args):
         print(f"Error: {e}")
 
 
-def cmd_status(args):
+def cmd_status(args: List[str]) -> None:
     """Show current status."""
     config = load_config()
     used = get_today_usage()
@@ -1094,13 +1345,13 @@ def cmd_status(args):
     print(f"Dashboard:     http://127.0.0.1:{config['admin_port']}")
 
 
-def cmd_reset(args):
+def cmd_reset(args: List[str]) -> None:
     """Reset today's time."""
     update_daily_usage(0)
     print("Today's usage reset to zero.")
 
 
-def cmd_policies(args):
+def cmd_policies(args: List[str]) -> None:
     """Apply Firefox policies."""
     config = load_config()
     if apply_firefox_policies(config):
@@ -1109,7 +1360,7 @@ def cmd_policies(args):
         print("Failed to apply policies. Try with sudo.")
 
 
-def main():
+def main() -> None:
     if len(sys.argv) < 2:
         print("KidSafe - Parental Control Kiosk for macOS")
         print()
