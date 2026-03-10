@@ -15,9 +15,11 @@ Designed for macOS 11+ (Big Sur), Python 3.8+, zero dependencies.
 
 from __future__ import annotations
 
+import ipaddress
 import json
 import os
 import signal
+import socket
 import sqlite3
 import subprocess
 import sys
@@ -79,6 +81,11 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "cleanbrowsing": "https://doh.cleanbrowsing.org/doh/family-filter/",
         "cloudflare_family": "https://family.cloudflare-dns.com/dns-query",
         "opendns": "https://doh.familyshield.opendns.com/dns-query"
+    },
+    "remote_access": {
+        "enabled": False,
+        "bind_address": "0.0.0.0",
+        "allowed_ips": []
     }
 }
 
@@ -237,6 +244,71 @@ def verify_password(password: str, stored: str) -> bool:
         return False
     salt, hashed = stored.split(":")
     return hashlib.sha256((salt + password).encode()).hexdigest() == hashed
+
+
+# --- IP Filtering & Rate Limiting ---
+
+def is_ip_allowed(client_ip: str, allowed_ips: List[str]) -> bool:
+    """Check if client IP is in the allowed list (IPs or CIDR ranges).
+
+    If allowed_ips is empty, all IPs are allowed (LAN-open mode).
+    """
+    if not allowed_ips:
+        return True
+    try:
+        addr = ipaddress.ip_address(client_ip)
+    except ValueError:
+        return False
+    for entry in allowed_ips:
+        try:
+            if "/" in entry:
+                if addr in ipaddress.ip_network(entry, strict=False):
+                    return True
+            else:
+                if addr == ipaddress.ip_address(entry):
+                    return True
+        except ValueError:
+            continue
+    return False
+
+
+def get_local_ip() -> str:
+    """Get the Mac's local network IP address."""
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(("8.8.8.8", 80))
+        ip = s.getsockname()[0]
+        s.close()
+        return ip
+    except Exception:
+        return "127.0.0.1"
+
+
+class RateLimiter:
+    """Simple in-memory rate limiter: max_attempts per window_seconds per key."""
+
+    def __init__(self, max_attempts: int = 5, window_seconds: int = 60) -> None:
+        self.max_attempts = max_attempts
+        self.window_seconds = window_seconds
+        self._attempts: Dict[str, List[float]] = {}
+        self._lock = threading.Lock()
+
+    def is_allowed(self, key: str) -> bool:
+        """Check if key is within rate limit. Records the attempt if allowed."""
+        now = time.time()
+        cutoff = now - self.window_seconds
+        with self._lock:
+            attempts = self._attempts.get(key, [])
+            attempts = [t for t in attempts if t > cutoff]
+            if len(attempts) >= self.max_attempts:
+                self._attempts[key] = attempts
+                return False
+            attempts.append(now)
+            self._attempts[key] = attempts
+            return True
+
+
+login_rate_limiter = RateLimiter(max_attempts=5, window_seconds=60)
 
 
 # --- Firefox Policy Management ---
@@ -1204,6 +1276,33 @@ class DashboardHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(json.dumps(data).encode())
 
+    def get_client_ip(self) -> str:
+        """Get the client's IP address."""
+        return self.client_address[0]
+
+    def check_ip_allowed(self) -> bool:
+        """Check if the client IP is allowed by remote_access config.
+
+        Localhost (127.0.0.1, ::1) is always allowed.
+        When remote_access is disabled, only localhost is allowed.
+        When remote_access is enabled with allowed_ips, check the list.
+        When remote_access is enabled with empty allowed_ips, all IPs allowed.
+        """
+        client_ip = self.get_client_ip()
+        if client_ip in ("127.0.0.1", "::1"):
+            return True
+        assert DashboardHandler.config is not None
+        remote_cfg = DashboardHandler.config.get("remote_access", {})
+        if not remote_cfg.get("enabled", False):
+            return False
+        return is_ip_allowed(client_ip, remote_cfg.get("allowed_ips", []))
+
+    def log_remote_request(self) -> None:
+        """Log remote (non-localhost) requests to the events table."""
+        client_ip = self.get_client_ip()
+        if client_ip not in ("127.0.0.1", "::1"):
+            record_event("remote_access", f"{client_ip} {self.command} {self.path}")
+
     def check_auth(self) -> bool:
         auth = self.headers.get("Authorization", "")
         if auth.startswith("Bearer "):
@@ -1211,6 +1310,13 @@ class DashboardHandler(BaseHTTPRequestHandler):
         return False
 
     def do_GET(self) -> None:
+        if not self.check_ip_allowed():
+            self.send_json({"error": "forbidden"}, 403)
+            record_event("remote_blocked", f"{self.get_client_ip()} GET {self.path}")
+            return
+
+        self.log_remote_request()
+
         if self.path == "/" or self.path == "/dashboard":
             self.send_response(200)
             self.send_header("Content-Type", "text/html")
@@ -1244,17 +1350,31 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self.send_json({"error": "not found"}, 404)
 
     def do_POST(self) -> None:
+        if not self.check_ip_allowed():
+            self.send_json({"error": "forbidden"}, 403)
+            record_event("remote_blocked", f"{self.get_client_ip()} POST {self.path}")
+            return
+
+        self.log_remote_request()
+
         assert DashboardHandler.config is not None
         content_length = int(self.headers.get("Content-Length", "0"))
         body: Dict[str, Any] = json.loads(self.rfile.read(content_length)) if content_length > 0 else {}
 
         if self.path == "/api/login":
+            client_ip = self.get_client_ip()
+            if not login_rate_limiter.is_allowed(client_ip):
+                self.send_json({"error": "too many login attempts, try again later"}, 429)
+                record_event("rate_limited", f"{client_ip} login attempt blocked")
+                return
             password: str = body.get("password", "")
             if verify_password(password, DashboardHandler.config.get("admin_password_hash", "")):
                 token = secrets.token_hex(32)
                 DashboardHandler.auth_tokens.add(token)
+                record_event("login_success", f"{client_ip}")
                 self.send_json({"token": token})
             else:
+                record_event("login_failed", f"{client_ip}")
                 self.send_json({"error": "invalid password"}, 401)
             return
 
@@ -1286,8 +1406,20 @@ def run_dashboard(config: Dict[str, Any], kiosk: KioskManager, port: int = 8484)
     """Start the parent dashboard web server."""
     DashboardHandler.config = config
     DashboardHandler.kiosk = kiosk
-    server = HTTPServer(("127.0.0.1", port), DashboardHandler)
-    log(f"Dashboard running at http://127.0.0.1:{port}")
+    remote_cfg = config.get("remote_access", {})
+    if remote_cfg.get("enabled", False):
+        bind_addr = remote_cfg.get("bind_address", "0.0.0.0")
+        local_ip = get_local_ip()
+        log(f"Dashboard running at http://{local_ip}:{port} (remote access enabled)")
+        allowed = remote_cfg.get("allowed_ips", [])
+        if allowed:
+            log(f"  Allowed IPs: {', '.join(allowed)}")
+        else:
+            log(f"  Allowed IPs: all (no restrictions)")
+    else:
+        bind_addr = "127.0.0.1"
+        log(f"Dashboard running at http://127.0.0.1:{port}")
+    server = HTTPServer((bind_addr, port), DashboardHandler)
     server.serve_forever()
 
 
@@ -1309,6 +1441,12 @@ def cmd_setup(args: List[str]) -> None:
             flags["limit"] = args[i + 1]; i += 2
         elif args[i] == "--homepage" and i + 1 < len(args):
             flags["homepage"] = args[i + 1]; i += 2
+        elif args[i] == "--remote":
+            flags["remote"] = "true"; i += 1
+        elif args[i] == "--no-remote":
+            flags["remote"] = "false"; i += 1
+        elif args[i] == "--allowed-ips" and i + 1 < len(args):
+            flags["allowed_ips"] = args[i + 1]; i += 2
         else:
             i += 1
 
@@ -1351,15 +1489,48 @@ def cmd_setup(args: List[str]) -> None:
         if homepage:
             config["homepage"] = homepage
 
+    # Remote access configuration
+    if "remote_access" not in config:
+        config["remote_access"] = {"enabled": False, "bind_address": "0.0.0.0", "allowed_ips": []}
+
+    if "remote" in flags:
+        config["remote_access"]["enabled"] = flags["remote"] == "true"
+        if "allowed_ips" in flags:
+            ips = [ip.strip() for ip in flags["allowed_ips"].split(",") if ip.strip()]
+            config["remote_access"]["allowed_ips"] = ips
+    else:
+        current_remote = config["remote_access"].get("enabled", False)
+        default_yn = "Y/n" if current_remote else "y/N"
+        remote_input = input(f"\nEnable remote access from other devices on your network? [{default_yn}]: ").strip().lower()
+        if remote_input:
+            config["remote_access"]["enabled"] = remote_input in ("y", "yes")
+        # If unchanged and already set, keep it
+
+        if config["remote_access"]["enabled"]:
+            current_ips = config["remote_access"].get("allowed_ips", [])
+            current_str = ", ".join(current_ips) if current_ips else "all"
+            print(f"  Restrict to specific IPs/CIDRs (comma-separated), or leave blank for any device.")
+            ip_input = input(f"  Allowed IPs [{current_str}]: ").strip()
+            if ip_input:
+                config["remote_access"]["allowed_ips"] = [ip.strip() for ip in ip_input.split(",") if ip.strip()]
+            elif not current_ips:
+                config["remote_access"]["allowed_ips"] = []
+
     save_config(config)
     init_db()
 
     print("\nApplying Firefox policies...")
     apply_firefox_policies(config)
 
+    port = config["admin_port"]
     print(f"\nSetup complete! Config saved to {CONFIG_FILE}")
     print(f"Run 'kidsafe start' to launch the kiosk.")
-    print(f"Parent dashboard: http://127.0.0.1:{config['admin_port']}")
+    if config["remote_access"].get("enabled", False):
+        local_ip = get_local_ip()
+        print(f"Parent dashboard: http://{local_ip}:{port} (remote access enabled)")
+        print(f"Run 'kidsafe remote' to see the URL and QR code.")
+    else:
+        print(f"Parent dashboard: http://127.0.0.1:{port}")
 
 
 def cmd_start(args: List[str]) -> None:
@@ -1425,7 +1596,12 @@ def cmd_status(args: List[str]) -> None:
     print(f"Remaining:     {remaining} minutes")
     print(f"Daily limit:   {config['daily_limit_minutes']} minutes")
     print(f"Schedule:      {config['schedule']['allowed_start']} - {config['schedule']['allowed_end']}")
-    print(f"Dashboard:     http://127.0.0.1:{config['admin_port']}")
+    remote_cfg = config.get("remote_access", {})
+    if remote_cfg.get("enabled", False):
+        local_ip = get_local_ip()
+        print(f"Dashboard:     http://{local_ip}:{config['admin_port']} (remote)")
+    else:
+        print(f"Dashboard:     http://127.0.0.1:{config['admin_port']}")
 
 
 def cmd_reset(args: List[str]) -> None:
@@ -1443,6 +1619,75 @@ def cmd_policies(args: List[str]) -> None:
         print("Failed to apply policies. Try with sudo.")
 
 
+def generate_qr_ascii(url: str) -> Optional[str]:
+    """Generate ASCII QR code for a URL. Requires 'qrcode' pip package.
+
+    Returns None if qrcode is not installed.
+    """
+    try:
+        import io
+        qr_mod = __import__("qrcode")
+        qr = qr_mod.QRCode(
+            version=1,
+            error_correction=qr_mod.constants.ERROR_CORRECT_L,
+            box_size=1,
+            border=1,
+        )
+        qr.add_data(url)
+        qr.make(fit=True)
+        f = io.StringIO()
+        qr.print_ascii(out=f)
+        return f.getvalue()
+    except ImportError:
+        return None
+
+
+def cmd_remote(args: List[str]) -> None:
+    """Show remote dashboard access info with local IP and optional QR code."""
+    config = load_config()
+    port = config["admin_port"]
+    remote_cfg = config.get("remote_access", {})
+    local_ip = get_local_ip()
+
+    print("=== KidSafe Remote Access ===\n")
+
+    if not remote_cfg.get("enabled", False):
+        print("Remote access is DISABLED.")
+        print(f"Dashboard is only accessible at: http://127.0.0.1:{port}")
+        print()
+        print("To enable remote access, run 'kidsafe setup' or edit config:")
+        print(f"  {CONFIG_FILE}")
+        print()
+        print('Set "remote_access": {"enabled": true} to allow LAN access.')
+        return
+
+    url = f"http://{local_ip}:{port}"
+    print(f"Remote access is ENABLED")
+    print(f"Local IP:     {local_ip}")
+    print(f"Dashboard:    {url}")
+    print()
+
+    allowed = remote_cfg.get("allowed_ips", [])
+    if allowed:
+        print(f"Allowed IPs:  {', '.join(allowed)}")
+    else:
+        print("Allowed IPs:  all (any device on this network)")
+    print()
+
+    # Show QR code
+    if "--no-qr" not in args:
+        qr_text = generate_qr_ascii(url)
+        if qr_text:
+            print("Scan this QR code with your phone:\n")
+            print(qr_text)
+        else:
+            print("Tip: Install 'qrcode' for a scannable QR code:")
+            print("  pip3 install qrcode")
+            print()
+
+    print("Open the URL above on any device connected to this Wi-Fi network.")
+
+
 def main() -> None:
     if len(sys.argv) < 2:
         print("KidSafe - Parental Control Kiosk for macOS")
@@ -1456,6 +1701,7 @@ def main() -> None:
         print("  status    Show current status")
         print("  reset     Reset today's time usage")
         print("  policies  Apply Firefox policies")
+        print("  remote    Show remote access URL and QR code")
         sys.exit(0)
 
     commands = {
@@ -1465,6 +1711,7 @@ def main() -> None:
         "status": cmd_status,
         "reset": cmd_reset,
         "policies": cmd_policies,
+        "remote": cmd_remote,
     }
 
     cmd = sys.argv[1]
