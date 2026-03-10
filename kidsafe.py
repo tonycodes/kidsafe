@@ -13,9 +13,13 @@ Locks a macOS user account to Firefox-only browsing with:
 Designed for macOS 11+ (Big Sur), Python 3.8+, zero dependencies.
 """
 
+from __future__ import annotations
+
+import ipaddress
 import json
 import os
 import signal
+import socket
 import sqlite3
 import subprocess
 import sys
@@ -23,19 +27,22 @@ import time
 import threading
 import hashlib
 import secrets
+import re
 from datetime import datetime, timedelta
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
+from typing import Any, Dict, List, Optional, Set
+from types import FrameType
 from urllib.parse import parse_qs, urlparse
 
 # --- Configuration ---
 
-CONFIG_DIR = Path.home() / ".kidsafe"
-CONFIG_FILE = CONFIG_DIR / "config.json"
-DB_FILE = CONFIG_DIR / "activity.db"
-LOG_FILE = CONFIG_DIR / "kidsafe.log"
+CONFIG_DIR: Path = Path.home() / ".kidsafe"
+CONFIG_FILE: Path = CONFIG_DIR / "config.json"
+DB_FILE: Path = CONFIG_DIR / "activity.db"
+LOG_FILE: Path = CONFIG_DIR / "kidsafe.log"
 
-DEFAULT_CONFIG = {
+DEFAULT_CONFIG: Dict[str, Any] = {
     "child_user": "emilio",
     "admin_password_hash": "",
     "admin_port": 8484,
@@ -74,11 +81,17 @@ DEFAULT_CONFIG = {
         "cleanbrowsing": "https://doh.cleanbrowsing.org/doh/family-filter/",
         "cloudflare_family": "https://family.cloudflare-dns.com/dns-query",
         "opendns": "https://doh.familyshield.opendns.com/dns-query"
-    }
+    },
+    "remote_access": {
+        "enabled": False,
+        "bind_address": "0.0.0.0",
+        "allowed_ips": []
+    },
+    "weekly_schedule": None
 }
 
 
-def log(msg):
+def log(msg: str) -> None:
     """Simple logging to file and stdout."""
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     line = f"[{timestamp}] {msg}"
@@ -92,7 +105,7 @@ def log(msg):
 
 # --- Database ---
 
-def init_db():
+def init_db() -> None:
     """Initialize SQLite database for activity tracking."""
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(str(DB_FILE))
@@ -122,7 +135,7 @@ def init_db():
     conn.close()
 
 
-def record_event(event_type, detail=""):
+def record_event(event_type: str, detail: str = "") -> None:
     """Record an event to the database."""
     try:
         conn = sqlite3.connect(str(DB_FILE))
@@ -136,7 +149,7 @@ def record_event(event_type, detail=""):
         log(f"DB error: {e}")
 
 
-def get_today_usage():
+def get_today_usage() -> int:
     """Get total usage seconds for today."""
     try:
         conn = sqlite3.connect(str(DB_FILE))
@@ -150,7 +163,7 @@ def get_today_usage():
         return 0
 
 
-def update_daily_usage(seconds):
+def update_daily_usage(seconds: int) -> None:
     """Update today's usage total."""
     try:
         conn = sqlite3.connect(str(DB_FILE))
@@ -165,7 +178,7 @@ def update_daily_usage(seconds):
         log(f"DB error: {e}")
 
 
-def get_usage_history(days=7):
+def get_usage_history(days: int = 7) -> List[Dict[str, Any]]:
     """Get usage history for the last N days."""
     try:
         conn = sqlite3.connect(str(DB_FILE))
@@ -180,7 +193,7 @@ def get_usage_history(days=7):
         return []
 
 
-def get_recent_events(limit=50):
+def get_recent_events(limit: int = 50) -> List[Dict[str, Any]]:
     """Get recent events."""
     try:
         conn = sqlite3.connect(str(DB_FILE))
@@ -196,12 +209,12 @@ def get_recent_events(limit=50):
 
 # --- Config ---
 
-def load_config():
+def load_config() -> Dict[str, Any]:
     """Load config from file, creating defaults if needed."""
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
     if CONFIG_FILE.exists():
         with open(CONFIG_FILE) as f:
-            config = json.load(f)
+            config: Dict[str, Any] = json.load(f)
         # Merge any new default keys
         for key, val in DEFAULT_CONFIG.items():
             if key not in config:
@@ -212,21 +225,107 @@ def load_config():
         return DEFAULT_CONFIG.copy()
 
 
-def save_config(config):
+def save_config(config: Dict[str, Any]) -> None:
     """Save config to file."""
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
     with open(CONFIG_FILE, "w") as f:
         json.dump(config, f, indent=2)
 
 
-def hash_password(password):
+DAY_KEYS: List[str] = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"]
+
+
+def get_today_day_key() -> str:
+    """Return today's day key (mon-sun)."""
+    return DAY_KEYS[datetime.now().weekday()]
+
+
+def get_today_schedule(config: Dict[str, Any]) -> Dict[str, Any]:
+    """Get today's schedule entry from weekly_schedule, or build from flat config.
+
+    Returns dict with 'limit_minutes' and 'windows' (list of {start, end}).
+    Falls back to flat daily_limit_minutes + schedule when weekly_schedule is
+    not configured or has no entry for today.
+    """
+    ws = config.get("weekly_schedule")
+    if ws:
+        day_key = get_today_day_key()
+        entry = ws.get(day_key)
+        if entry:
+            return {
+                "limit_minutes": entry.get("limit_minutes", config["daily_limit_minutes"]),
+                "windows": entry.get("windows", []),
+            }
+    # Fallback to flat config
+    sched = config.get("schedule", {})
+    windows: List[Dict[str, str]] = []
+    if sched.get("enabled", True):
+        windows = [{"start": sched.get("allowed_start", "07:00"),
+                     "end": sched.get("allowed_end", "20:00")}]
+    return {
+        "limit_minutes": config["daily_limit_minutes"],
+        "windows": windows,
+    }
+
+
+def is_time_in_windows(windows: List[Dict[str, str]]) -> bool:
+    """Check if the current time falls within any of the given windows.
+
+    An empty windows list means no schedule restrictions (always allowed).
+    """
+    if not windows:
+        return True
+    now = datetime.now().strftime("%H:%M")
+    for w in windows:
+        if w["start"] <= now <= w["end"]:
+            return True
+    return False
+
+
+def validate_weekly_schedule(ws: Any) -> Optional[str]:
+    """Validate a weekly_schedule structure. Returns error message or None."""
+    if ws is None:
+        return None
+    if not isinstance(ws, dict):
+        return "weekly_schedule must be an object"
+    valid_days = set(DAY_KEYS)
+    for day, entry in ws.items():
+        if day not in valid_days:
+            return f"Invalid day key: {day}. Must be one of {DAY_KEYS}"
+        if not isinstance(entry, dict):
+            return f"{day}: entry must be an object"
+        if "limit_minutes" in entry:
+            lm = entry["limit_minutes"]
+            if not isinstance(lm, (int, float)) or lm < 0 or lm > 1440:
+                return f"{day}: limit_minutes must be 0-1440"
+        if "windows" in entry:
+            wins = entry["windows"]
+            if not isinstance(wins, list):
+                return f"{day}: windows must be an array"
+            if len(wins) > 4:
+                return f"{day}: maximum 4 windows per day"
+            for i, w in enumerate(wins):
+                if not isinstance(w, dict):
+                    return f"{day}: window {i} must be an object"
+                if "start" not in w or "end" not in w:
+                    return f"{day}: window {i} must have start and end"
+                if not re.match(r"^\d{2}:\d{2}$", w["start"]):
+                    return f"{day}: window {i} start must be HH:MM"
+                if not re.match(r"^\d{2}:\d{2}$", w["end"]):
+                    return f"{day}: window {i} end must be HH:MM"
+                if w["start"] >= w["end"]:
+                    return f"{day}: window {i} start must be before end"
+    return None
+
+
+def hash_password(password: str) -> str:
     """Hash a password with a salt."""
     salt = secrets.token_hex(16)
     hashed = hashlib.sha256((salt + password).encode()).hexdigest()
     return f"{salt}:{hashed}"
 
 
-def verify_password(password, stored):
+def verify_password(password: str, stored: str) -> bool:
     """Verify a password against stored hash."""
     if not stored:
         return False
@@ -234,20 +333,85 @@ def verify_password(password, stored):
     return hashlib.sha256((salt + password).encode()).hexdigest() == hashed
 
 
+# --- IP Filtering & Rate Limiting ---
+
+def is_ip_allowed(client_ip: str, allowed_ips: List[str]) -> bool:
+    """Check if client IP is in the allowed list (IPs or CIDR ranges).
+
+    If allowed_ips is empty, all IPs are allowed (LAN-open mode).
+    """
+    if not allowed_ips:
+        return True
+    try:
+        addr = ipaddress.ip_address(client_ip)
+    except ValueError:
+        return False
+    for entry in allowed_ips:
+        try:
+            if "/" in entry:
+                if addr in ipaddress.ip_network(entry, strict=False):
+                    return True
+            else:
+                if addr == ipaddress.ip_address(entry):
+                    return True
+        except ValueError:
+            continue
+    return False
+
+
+def get_local_ip() -> str:
+    """Get the Mac's local network IP address."""
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(("8.8.8.8", 80))
+        ip = s.getsockname()[0]
+        s.close()
+        return ip
+    except Exception:
+        return "127.0.0.1"
+
+
+class RateLimiter:
+    """Simple in-memory rate limiter: max_attempts per window_seconds per key."""
+
+    def __init__(self, max_attempts: int = 5, window_seconds: int = 60) -> None:
+        self.max_attempts = max_attempts
+        self.window_seconds = window_seconds
+        self._attempts: Dict[str, List[float]] = {}
+        self._lock = threading.Lock()
+
+    def is_allowed(self, key: str) -> bool:
+        """Check if key is within rate limit. Records the attempt if allowed."""
+        now = time.time()
+        cutoff = now - self.window_seconds
+        with self._lock:
+            attempts = self._attempts.get(key, [])
+            attempts = [t for t in attempts if t > cutoff]
+            if len(attempts) >= self.max_attempts:
+                self._attempts[key] = attempts
+                return False
+            attempts.append(now)
+            self._attempts[key] = attempts
+            return True
+
+
+login_rate_limiter = RateLimiter(max_attempts=5, window_seconds=60)
+
+
 # --- Firefox Policy Management ---
 
-FIREFOX_POLICY_DIR = Path("/Applications/Firefox.app/Contents/Resources/distribution")
-FIREFOX_POLICY_FILE = FIREFOX_POLICY_DIR / "policies.json"
+FIREFOX_POLICY_DIR: Path = Path("/Applications/Firefox.app/Contents/Resources/distribution")
+FIREFOX_POLICY_FILE: Path = FIREFOX_POLICY_DIR / "policies.json"
 
 
-def generate_firefox_policies(config):
+def generate_firefox_policies(config: Dict[str, Any]) -> Dict[str, Any]:
     """Generate Firefox enterprise policies for content filtering."""
-    dns_url = config["dns_providers"].get(
+    dns_url: str = config["dns_providers"].get(
         config["dns_provider"],
         config["dns_providers"]["cleanbrowsing"]
     )
 
-    policies = {
+    policies: Dict[str, Any] = {
         "policies": {
             # Force DNS-over-HTTPS with family filter
             "DNSOverHTTPS": {
@@ -308,7 +472,7 @@ def generate_firefox_policies(config):
     }
 
     # Add bookmarks for allowed sites
-    toolbar_bookmarks = []
+    toolbar_bookmarks: List[Dict[str, str]] = []
     for site in config["allowed_sites"][:10]:
         name = site.split(".")[0].replace("/", " ").title()
         toolbar_bookmarks.append({
@@ -323,7 +487,7 @@ def generate_firefox_policies(config):
     # Website filter (whitelist mode if allowed_sites is set)
     if config.get("allowed_sites"):
         # Block everything, then allow specific sites
-        web_filter = {"Block": ["*"]}
+        web_filter: Dict[str, List[str]] = {"Block": ["*"]}
         exceptions = [f"*://*.{site}/*" for site in config["allowed_sites"]]
         # Also allow the homepage domain
         homepage_domain = urlparse(config["homepage"]).netloc
@@ -343,7 +507,7 @@ def generate_firefox_policies(config):
     return policies
 
 
-def apply_firefox_policies(config):
+def apply_firefox_policies(config: Dict[str, Any]) -> bool:
     """Write Firefox enterprise policies to disk."""
     policies = generate_firefox_policies(config)
     try:
@@ -363,16 +527,14 @@ def apply_firefox_policies(config):
 # --- App Enforcer (kills unauthorized apps) ---
 # Uses `ps` to find running .app processes — no Accessibility permissions needed.
 
-import re
-
 # .app bundles that are allowed to run (lowercase). Everything else from
 # /Applications/ or /System/Applications/ gets killed.
-ALLOWED_APP_BUNDLES = {
+ALLOWED_APP_BUNDLES: Set[str] = {
     "firefox.app",
 }
 
 
-def find_unauthorized_apps():
+def find_unauthorized_apps() -> Dict[str, List[int]]:
     """Find running .app processes that aren't in the allowed list.
     Returns dict of {app_name: [pids]} for apps that should be killed.
     No special permissions required — just reads `ps` output."""
@@ -384,7 +546,7 @@ def find_unauthorized_apps():
     except Exception:
         return {}
 
-    apps = {}  # {app_name: [pids]}
+    apps: Dict[str, List[int]] = {}  # {app_name: [pids]}
     for line in result.stdout.strip().split("\n")[1:]:
         parts = line.strip().split(None, 1)
         if len(parts) < 2:
@@ -402,10 +564,10 @@ def find_unauthorized_apps():
     return apps
 
 
-def kill_unauthorized_apps():
+def kill_unauthorized_apps() -> List[str]:
     """Kill all unauthorized .app processes. Returns list of app names killed."""
     apps = find_unauthorized_apps()
-    killed = []
+    killed: List[str] = []
     for app_name, pids in apps.items():
         for pid in pids:
             try:
@@ -419,21 +581,21 @@ def kill_unauthorized_apps():
 class AppEnforcer:
     """Background thread that continuously kills unauthorized apps."""
 
-    def __init__(self, check_interval=2):
-        self.check_interval = check_interval
-        self.running = False
-        self.thread = None
+    def __init__(self, check_interval: int = 2) -> None:
+        self.check_interval: int = check_interval
+        self.running: bool = False
+        self.thread: Optional[threading.Thread] = None
 
-    def start(self):
+    def start(self) -> None:
         self.running = True
         self.thread = threading.Thread(target=self._run, daemon=True)
         self.thread.start()
         log("App enforcer started — unauthorized apps will be killed")
 
-    def stop(self):
+    def stop(self) -> None:
         self.running = False
 
-    def _run(self):
+    def _run(self) -> None:
         while self.running:
             try:
                 killed = kill_unauthorized_apps()
@@ -450,29 +612,35 @@ class AppEnforcer:
 class KioskManager:
     """Manages Firefox in kiosk mode with time limits."""
 
-    def __init__(self, config):
-        self.config = config
-        self.firefox_process = None
-        self.session_start = None
-        self.running = False
-        self.session_seconds = 0
-        self.enforcer = AppEnforcer(check_interval=2)
+    def __init__(self, config: Dict[str, Any]) -> None:
+        self.config: Dict[str, Any] = config
+        self.firefox_process: Optional[subprocess.Popen[bytes]] = None
+        self.session_start: Optional[datetime] = None
+        self.running: bool = False
+        self.session_seconds: int = 0
+        self.enforcer: AppEnforcer = AppEnforcer(check_interval=2)
 
-    def is_within_schedule(self):
-        """Check if current time is within allowed schedule."""
-        if not self.config["schedule"]["enabled"]:
-            return True
-        now = datetime.now().strftime("%H:%M")
-        return self.config["schedule"]["allowed_start"] <= now <= self.config["schedule"]["allowed_end"]
+    def is_within_schedule(self) -> bool:
+        """Check if current time is within allowed schedule windows.
 
-    def get_remaining_minutes(self):
+        Uses weekly_schedule for today if configured, otherwise falls back
+        to the flat schedule config.
+        """
+        today = get_today_schedule(self.config)
+        return is_time_in_windows(today["windows"])
+
+    def get_today_limit_minutes(self) -> int:
+        """Get today's daily limit in minutes (from weekly or flat config)."""
+        return get_today_schedule(self.config)["limit_minutes"]
+
+    def get_remaining_minutes(self) -> int:
         """Get remaining minutes for today."""
         used = get_today_usage()
-        limit = self.config["daily_limit_minutes"] * 60
+        limit: int = self.get_today_limit_minutes() * 60
         remaining = max(0, limit - used)
         return remaining // 60
 
-    def hide_dock(self):
+    def hide_dock(self) -> None:
         """Auto-hide the Dock so the child only sees Firefox."""
         try:
             subprocess.run(
@@ -483,7 +651,7 @@ class KioskManager:
         except Exception:
             pass
 
-    def ensure_firefox_fullscreen(self):
+    def ensure_firefox_fullscreen(self) -> None:
         """Make sure Firefox is in fullscreen. Sends Cmd+Shift+F if not."""
         try:
             # Check if Firefox has a fullscreen window
@@ -503,7 +671,7 @@ class KioskManager:
         except Exception:
             pass
 
-    def launch_firefox(self):
+    def launch_firefox(self) -> bool:
         """Launch Firefox in kiosk mode."""
         cmd = ["/Applications/Firefox.app/Contents/MacOS/firefox"]
         if self.config["firefox_kiosk"]:
@@ -526,7 +694,7 @@ class KioskManager:
             log(f"Failed to launch Firefox: {e}")
             return False
 
-    def stop_firefox(self):
+    def stop_firefox(self) -> None:
         """Stop Firefox gracefully."""
         if self.firefox_process:
             try:
@@ -540,13 +708,13 @@ class KioskManager:
             log("Firefox stopped")
             record_event("firefox_stop")
 
-    def is_firefox_running(self):
+    def is_firefox_running(self) -> bool:
         """Check if Firefox process is still running."""
         if self.firefox_process:
             return self.firefox_process.poll() is None
         return False
 
-    def show_notification(self, title, message):
+    def show_notification(self, title: str, message: str) -> None:
         """Show a macOS notification."""
         try:
             subprocess.run([
@@ -556,7 +724,7 @@ class KioskManager:
         except Exception:
             pass
 
-    def show_times_up_screen(self):
+    def show_times_up_screen(self) -> None:
         """Show a 'Time's Up' dialog."""
         try:
             subprocess.run([
@@ -568,21 +736,26 @@ class KioskManager:
         except Exception:
             pass
 
-    def show_outside_schedule_screen(self):
-        """Show an 'Outside Schedule' dialog."""
-        start = self.config["schedule"]["allowed_start"]
-        end = self.config["schedule"]["allowed_end"]
+    def show_outside_schedule_screen(self) -> None:
+        """Show an 'Outside Schedule' dialog with today's windows."""
+        today = get_today_schedule(self.config)
+        windows = today["windows"]
+        if windows:
+            parts = [f"{w['start']}-{w['end']}" for w in windows]
+            time_str = ", ".join(parts)
+        else:
+            time_str = "No time scheduled"
         try:
             subprocess.run([
                 "osascript", "-e",
-                f'display dialog "Computer time is between {start} and {end}." '
+                f'display dialog "Computer time is: {time_str}." '
                 'buttons {"OK"} default button "OK" '
                 'with title "KidSafe" with icon caution'
             ], timeout=30, capture_output=True)
         except Exception:
             pass
 
-    def run(self):
+    def run(self) -> None:
         """Main kiosk loop."""
         self.running = True
         log("KidSafe kiosk manager started")
@@ -604,7 +777,7 @@ class KioskManager:
 
                 # Check time limit
                 today_usage = get_today_usage()
-                limit_seconds = self.config["daily_limit_minutes"] * 60
+                limit_seconds = self.get_today_limit_minutes() * 60
 
                 if today_usage >= limit_seconds:
                     if self.is_firefox_running():
@@ -652,66 +825,310 @@ class KioskManager:
         record_event("kiosk_stop")
         log("KidSafe kiosk manager stopped")
 
-    def stop(self):
+    def stop(self) -> None:
         """Signal the kiosk to stop."""
         self.running = False
 
 
 # --- Parent Dashboard Web Server ---
 
-DASHBOARD_HTML = """<!DOCTYPE html>
+DASHBOARD_HTML: str = """<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="default">
 <title>KidSafe Dashboard</title>
 <style>
-  * { margin: 0; padding: 0; box-sizing: border-box; }
-  body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
-         background: #f5f5f7; color: #1d1d1f; padding: 20px; max-width: 800px; margin: 0 auto; }
-  h1 { font-size: 28px; margin-bottom: 8px; }
-  h2 { font-size: 20px; margin: 24px 0 12px; color: #6e6e73; }
-  .subtitle { color: #6e6e73; margin-bottom: 24px; }
-  .card { background: white; border-radius: 12px; padding: 20px; margin-bottom: 16px;
-          box-shadow: 0 1px 3px rgba(0,0,0,0.1); }
-  .stat { display: inline-block; text-align: center; margin-right: 32px; }
-  .stat-value { font-size: 36px; font-weight: 700; color: #0071e3; }
-  .stat-label { font-size: 13px; color: #6e6e73; margin-top: 4px; }
-  .bar { height: 8px; background: #e5e5ea; border-radius: 4px; margin: 8px 0; }
-  .bar-fill { height: 100%; background: #0071e3; border-radius: 4px; transition: width 0.3s; }
-  .bar-fill.warning { background: #ff9500; }
-  .bar-fill.danger { background: #ff3b30; }
+  *, *::before, *::after { margin: 0; padding: 0; box-sizing: border-box; }
+  :root {
+    --blue: #0071e3; --blue-hover: #0077ed; --green: #34c759; --orange: #ff9500;
+    --red: #ff3b30; --red-hover: #ff453a; --gray-bg: #f5f5f7; --gray-100: #e5e5ea;
+    --gray-200: #d2d2d7; --gray-text: #6e6e73; --gray-dark: #1d1d1f;
+    --card-bg: white; --card-shadow: 0 1px 3px rgba(0,0,0,0.08);
+    --radius: 12px; --radius-sm: 8px;
+    --safe-top: env(safe-area-inset-top, 0px);
+    --safe-bottom: env(safe-area-inset-bottom, 0px);
+  }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif;
+    background: var(--gray-bg); color: var(--gray-dark);
+    line-height: 1.5; -webkit-text-size-adjust: 100%;
+    padding-top: var(--safe-top); padding-bottom: var(--safe-bottom);
+  }
+
+  /* --- Toast --- */
+  .toast-container { position: fixed; top: 16px; right: 16px; z-index: 9999; display: flex; flex-direction: column; gap: 8px; pointer-events: none; }
+  .toast {
+    pointer-events: auto; padding: 12px 20px; border-radius: var(--radius-sm);
+    font-size: 14px; font-weight: 500; color: white; opacity: 0;
+    transform: translateX(40px); transition: all 0.3s ease;
+    box-shadow: 0 4px 12px rgba(0,0,0,0.15); max-width: 340px;
+  }
+  .toast.show { opacity: 1; transform: translateX(0); }
+  .toast.success { background: var(--green); }
+  .toast.error { background: var(--red); }
+  .toast.info { background: var(--blue); }
+
+  /* --- Login --- */
+  .login-wrapper {
+    display: flex; align-items: center; justify-content: center;
+    min-height: 100vh; min-height: 100dvh; padding: 20px;
+  }
+  .login-card {
+    background: var(--card-bg); border-radius: 16px; padding: 40px 32px;
+    box-shadow: 0 4px 24px rgba(0,0,0,0.1); width: 100%; max-width: 380px; text-align: center;
+  }
+  .login-card .logo { font-size: 40px; margin-bottom: 8px; }
+  .login-card h1 { font-size: 24px; margin-bottom: 4px; }
+  .login-card .subtitle { color: var(--gray-text); margin-bottom: 24px; font-size: 15px; }
+  .login-card input {
+    width: 100%; padding: 12px 16px; border: 1.5px solid var(--gray-200);
+    border-radius: var(--radius-sm); font-size: 16px; margin-bottom: 16px;
+    outline: none; transition: border-color 0.2s;
+  }
+  .login-card input:focus { border-color: var(--blue); }
+  .login-card button {
+    width: 100%; padding: 12px; background: var(--blue); color: white;
+    border: none; border-radius: var(--radius-sm); font-size: 16px;
+    font-weight: 600; cursor: pointer; transition: background 0.2s;
+  }
+  .login-card button:hover { background: var(--blue-hover); }
+
+  /* --- Header --- */
+  .header {
+    background: var(--card-bg); border-bottom: 1px solid var(--gray-100);
+    padding: 12px 20px; position: sticky; top: 0; z-index: 100;
+    box-shadow: 0 1px 3px rgba(0,0,0,0.04);
+  }
+  .header-inner {
+    max-width: 900px; margin: 0 auto; display: flex;
+    align-items: center; justify-content: space-between; gap: 12px;
+  }
+  .header-left { display: flex; align-items: center; gap: 10px; min-width: 0; }
+  .header-logo { font-size: 20px; font-weight: 700; white-space: nowrap; }
+  .header-child { font-size: 14px; color: var(--gray-text); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .header-right { display: flex; align-items: center; gap: 12px; flex-shrink: 0; }
+  .status-badge {
+    display: inline-flex; align-items: center; gap: 6px; font-size: 13px;
+    font-weight: 500; padding: 4px 10px; border-radius: 20px; white-space: nowrap;
+  }
+  .status-badge.active { background: #d1f2d1; color: #1b7a1b; }
+  .status-badge.inactive { background: #fdd; color: #c00; }
+  .status-badge.outside { background: #fff3cd; color: #856404; }
+  .status-dot { width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0; }
+  .status-badge.active .status-dot { background: var(--green); }
+  .status-badge.inactive .status-dot { background: var(--red); }
+  .status-badge.outside .status-dot { background: var(--orange); }
+  .header-time { font-size: 13px; color: var(--gray-text); font-weight: 500; white-space: nowrap; }
+  .header-logout {
+    background: none; border: none; color: var(--gray-text); font-size: 13px;
+    cursor: pointer; padding: 4px 8px; border-radius: 6px;
+  }
+  .header-logout:hover { background: var(--gray-100); color: var(--gray-dark); }
+
+  /* --- Tab Bar --- */
+  .tab-bar {
+    background: var(--card-bg); border-bottom: 1px solid var(--gray-100);
+    overflow-x: auto; -webkit-overflow-scrolling: touch;
+    scrollbar-width: none;
+  }
+  .tab-bar::-webkit-scrollbar { display: none; }
+  .tab-bar-inner {
+    max-width: 900px; margin: 0 auto; display: flex; padding: 0 12px;
+  }
+  .tab-btn {
+    flex: 1; padding: 12px 16px; background: none; border: none;
+    border-bottom: 2px solid transparent; font-size: 14px; font-weight: 500;
+    color: var(--gray-text); cursor: pointer; white-space: nowrap;
+    text-align: center; transition: all 0.2s; min-width: 0;
+  }
+  .tab-btn:hover { color: var(--gray-dark); }
+  .tab-btn.active { color: var(--blue); border-bottom-color: var(--blue); }
+
+  /* --- Main Content --- */
+  .main { max-width: 900px; margin: 0 auto; padding: 20px 16px; }
+  .tab-content { display: none; }
+  .tab-content.active { display: block; }
+
+  /* --- Cards & Components --- */
+  .card {
+    background: var(--card-bg); border-radius: var(--radius); padding: 20px;
+    margin-bottom: 16px; box-shadow: var(--card-shadow);
+  }
+  .card-title { font-size: 17px; font-weight: 600; margin-bottom: 16px; }
+  .stats-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; margin-bottom: 16px; }
+  .stat { text-align: center; }
+  .stat-value { font-size: 32px; font-weight: 700; color: var(--blue); }
+  .stat-label { font-size: 12px; color: var(--gray-text); margin-top: 2px; }
+  .bar { height: 8px; background: var(--gray-100); border-radius: 4px; margin: 4px 0; overflow: hidden; }
+  .bar-fill { height: 100%; border-radius: 4px; transition: width 0.4s ease; background: var(--blue); }
+  .bar-fill.warning { background: var(--orange); }
+  .bar-fill.danger { background: var(--red); }
+  .bar-label { display: flex; justify-content: space-between; font-size: 12px; color: var(--gray-text); }
+
+  /* Controls */
+  .controls-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 10px; }
+  .ctrl-btn {
+    padding: 12px 16px; border: none; border-radius: var(--radius-sm);
+    font-size: 14px; font-weight: 500; cursor: pointer; transition: all 0.2s; text-align: center;
+  }
+  .ctrl-btn.primary { background: var(--blue); color: white; }
+  .ctrl-btn.primary:hover { background: var(--blue-hover); }
+  .ctrl-btn.secondary { background: var(--gray-100); color: var(--gray-dark); }
+  .ctrl-btn.secondary:hover { background: var(--gray-200); }
+  .ctrl-btn.danger { background: var(--red); color: white; }
+  .ctrl-btn.danger:hover { background: var(--red-hover); }
+
+  /* Tables */
   table { width: 100%; border-collapse: collapse; }
-  th, td { padding: 8px 12px; text-align: left; border-bottom: 1px solid #e5e5ea; }
-  th { font-weight: 600; color: #6e6e73; font-size: 13px; text-transform: uppercase; }
-  td { font-size: 14px; }
-  input, select { padding: 8px 12px; border: 1px solid #d2d2d7; border-radius: 8px;
-                  font-size: 14px; width: 100%; margin-bottom: 8px; }
-  button { padding: 10px 20px; background: #0071e3; color: white; border: none;
-           border-radius: 8px; font-size: 14px; cursor: pointer; margin-right: 8px; }
-  button:hover { background: #0077ed; }
-  button.danger { background: #ff3b30; }
-  button.danger:hover { background: #ff453a; }
-  .tag { display: inline-block; background: #e5e5ea; padding: 4px 10px;
-         border-radius: 6px; font-size: 13px; margin: 2px; }
-  .tag .remove { cursor: pointer; margin-left: 4px; color: #ff3b30; }
-  .form-row { display: flex; gap: 8px; align-items: center; margin-bottom: 8px; }
-  .form-row input { flex: 1; }
-  .form-row button { flex-shrink: 0; }
-  .event-type { font-weight: 600; font-size: 12px; padding: 2px 8px; border-radius: 4px; }
+  th, td { padding: 10px 12px; text-align: left; border-bottom: 1px solid var(--gray-100); font-size: 14px; }
+  th { font-weight: 600; color: var(--gray-text); font-size: 12px; text-transform: uppercase; letter-spacing: 0.5px; }
+  .event-type {
+    display: inline-block; font-weight: 600; font-size: 11px; padding: 3px 8px;
+    border-radius: 4px; text-transform: uppercase; letter-spacing: 0.3px;
+  }
   .event-type.firefox_start { background: #d1f2d1; color: #1b7a1b; }
   .event-type.firefox_stop { background: #fdd; color: #c00; }
   .event-type.time_limit_reached { background: #fff3cd; color: #856404; }
   .event-type.kiosk_start { background: #d1ecf1; color: #0c5460; }
-  #login { max-width: 300px; margin: 100px auto; }
+  .event-type.config_update { background: #e8daef; color: #6c3483; }
+  .event-type.time_reset { background: #d5f5e3; color: #1e8449; }
+
+  /* Forms */
+  label { display: block; font-size: 14px; font-weight: 500; margin-bottom: 6px; color: var(--gray-dark); }
+  input[type="number"], input[type="time"], input[type="url"], input[type="text"] {
+    width: 100%; padding: 10px 12px; border: 1.5px solid var(--gray-200);
+    border-radius: var(--radius-sm); font-size: 15px; outline: none; transition: border-color 0.2s;
+    background: var(--card-bg);
+  }
+  input:focus { border-color: var(--blue); }
+  .form-group { margin-bottom: 20px; }
+  .form-row { display: flex; gap: 8px; align-items: flex-end; }
+  .form-row input { flex: 1; margin-bottom: 0; }
+  .form-row span { font-size: 14px; color: var(--gray-text); padding-bottom: 10px; }
+  .save-btn {
+    padding: 10px 20px; background: var(--blue); color: white; border: none;
+    border-radius: var(--radius-sm); font-size: 14px; font-weight: 500;
+    cursor: pointer; transition: background 0.2s; flex-shrink: 0;
+  }
+  .save-btn:hover { background: var(--blue-hover); }
+
+  /* Tags */
+  .tag-list { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 12px; }
+  .tag {
+    display: inline-flex; align-items: center; gap: 4px; background: var(--gray-100);
+    padding: 6px 12px; border-radius: 20px; font-size: 13px;
+  }
+  .tag .remove { cursor: pointer; color: var(--red); font-weight: 700; font-size: 14px; line-height: 1; }
+  .tag .remove:hover { opacity: 0.7; }
+
+  /* Analytics Chart */
+  .chart-bar-row { display: flex; align-items: center; gap: 10px; margin-bottom: 8px; }
+  .chart-label { font-size: 12px; color: var(--gray-text); min-width: 48px; text-align: right; }
+  .chart-track { flex: 1; height: 24px; background: var(--gray-100); border-radius: 4px; overflow: hidden; position: relative; }
+  .chart-fill { height: 100%; background: var(--blue); border-radius: 4px; transition: width 0.4s ease; }
+  .chart-value { font-size: 12px; font-weight: 600; min-width: 36px; }
+  .trend-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 12px; }
+  .trend-card { text-align: center; padding: 16px; background: var(--gray-bg); border-radius: var(--radius-sm); }
+  .trend-value { font-size: 28px; font-weight: 700; }
+  .trend-label { font-size: 12px; color: var(--gray-text); margin-top: 2px; }
+
+  /* Empty state */
+  .empty { text-align: center; padding: 40px 20px; color: var(--gray-text); font-size: 14px; }
+
+  /* Weekly Schedule Grid */
+  .ws-toggle { display: flex; align-items: center; gap: 10px; margin-bottom: 16px; }
+  .ws-toggle label { margin: 0; font-weight: 400; }
+  .ws-switch { position: relative; display: inline-block; width: 44px; height: 24px; flex-shrink: 0; }
+  .ws-switch input { opacity: 0; width: 0; height: 0; }
+  .ws-slider {
+    position: absolute; cursor: pointer; top: 0; left: 0; right: 0; bottom: 0;
+    background: var(--gray-200); border-radius: 24px; transition: 0.3s;
+  }
+  .ws-slider:before {
+    content: ""; position: absolute; height: 18px; width: 18px; left: 3px; bottom: 3px;
+    background: white; border-radius: 50%; transition: 0.3s;
+  }
+  .ws-switch input:checked + .ws-slider { background: var(--blue); }
+  .ws-switch input:checked + .ws-slider:before { transform: translateX(20px); }
+  .ws-day-card {
+    border: 1px solid var(--gray-100); border-radius: var(--radius-sm);
+    padding: 12px; margin-bottom: 10px;
+  }
+  .ws-day-card.today { border-color: var(--blue); background: #f0f7ff; }
+  .ws-day-header {
+    display: flex; align-items: center; justify-content: space-between;
+    margin-bottom: 8px;
+  }
+  .ws-day-name { font-weight: 600; font-size: 14px; text-transform: capitalize; }
+  .ws-day-name .today-badge {
+    font-size: 11px; font-weight: 500; background: var(--blue); color: white;
+    padding: 1px 6px; border-radius: 10px; margin-left: 6px;
+  }
+  .ws-limit-input { width: 70px; padding: 6px 8px; font-size: 14px; text-align: center; }
+  .ws-window-row { display: flex; align-items: center; gap: 6px; margin-top: 6px; }
+  .ws-window-row input[type="time"] { width: 110px; padding: 6px 8px; font-size: 13px; }
+  .ws-window-row span { font-size: 13px; color: var(--gray-text); }
+  .ws-add-btn, .ws-rm-btn {
+    border: none; border-radius: 4px; cursor: pointer; font-size: 13px;
+    padding: 4px 8px; transition: background 0.2s;
+  }
+  .ws-add-btn { background: var(--gray-100); color: var(--gray-dark); margin-top: 6px; }
+  .ws-add-btn:hover { background: var(--gray-200); }
+  .ws-rm-btn { background: none; color: var(--red); font-weight: 700; font-size: 16px; line-height: 1; padding: 2px 6px; }
+  .ws-rm-btn:hover { background: #fee; }
+  .ws-copy-row { display: flex; gap: 8px; align-items: center; margin-bottom: 12px; font-size: 13px; }
+  .ws-copy-row select { padding: 6px 8px; border: 1.5px solid var(--gray-200); border-radius: 6px; font-size: 13px; }
+
+  /* --- Responsive --- */
+  @media (max-width: 600px) {
+    .header-inner { flex-wrap: wrap; }
+    .header-right { width: 100%; justify-content: space-between; }
+    .stats-grid { grid-template-columns: repeat(3, 1fr); gap: 8px; }
+    .stat-value { font-size: 24px; }
+    .stat-label { font-size: 11px; }
+    .controls-grid { grid-template-columns: 1fr; }
+    .form-row { flex-direction: column; align-items: stretch; }
+    .form-row span { padding: 0; text-align: center; }
+    .save-btn { width: 100%; }
+    .trend-grid { grid-template-columns: repeat(2, 1fr); }
+    .toast-container { top: 8px; right: 8px; left: 8px; }
+    .toast { max-width: none; }
+    th, td { padding: 8px 6px; font-size: 13px; }
+    .main { padding: 16px 12px; }
+    .card { padding: 16px; }
+  }
+  @media (max-width: 374px) {
+    .tab-btn { font-size: 13px; padding: 10px 8px; }
+  }
 </style>
 </head>
 <body>
+<div id="toast-container" class="toast-container"></div>
 <div id="app"></div>
 <script>
 const app = document.getElementById('app');
+const toastContainer = document.getElementById('toast-container');
 let token = sessionStorage.getItem('kidsafe_token') || '';
+let activeTab = sessionStorage.getItem('kidsafe_tab') || 'overview';
+let cachedData = { status: null, config: null, history: null, events: null };
 
+/* --- Toast --- */
+function toast(msg, type='success') {
+  const el = document.createElement('div');
+  el.className = 'toast ' + type;
+  el.textContent = msg;
+  toastContainer.appendChild(el);
+  requestAnimationFrame(() => el.classList.add('show'));
+  setTimeout(() => {
+    el.classList.remove('show');
+    setTimeout(() => el.remove(), 300);
+  }, 3000);
+}
+
+/* --- API --- */
 async function api(path, method='GET', body=null) {
   const opts = { method, headers: {'Content-Type': 'application/json'} };
   if (token) opts.headers['Authorization'] = 'Bearer ' + token;
@@ -720,131 +1137,381 @@ async function api(path, method='GET', body=null) {
   return res.json();
 }
 
+/* --- Auth --- */
 async function login(pass) {
   const data = await api('/login', 'POST', { password: pass });
-  if (data.token) { token = data.token; sessionStorage.setItem('kidsafe_token', token); render(); }
-  else alert('Wrong password');
+  if (data.token) {
+    token = data.token;
+    sessionStorage.setItem('kidsafe_token', token);
+    render();
+  } else {
+    toast('Wrong password', 'error');
+  }
 }
 
+function logout() {
+  token = '';
+  sessionStorage.removeItem('kidsafe_token');
+  render();
+}
+
+/* --- Login Screen --- */
 function showLogin() {
   app.innerHTML = `
-    <div id="login" class="card">
-      <h1>KidSafe</h1>
-      <p class="subtitle">Parent Dashboard</p>
-      <input type="password" id="pass" placeholder="Admin password" onkeydown="if(event.key==='Enter')document.getElementById('loginBtn').click()">
-      <button id="loginBtn">Log In</button>
+    <div class="login-wrapper">
+      <div class="login-card">
+        <div class="logo">&#x1F6E1;&#xFE0F;</div>
+        <h1>KidSafe</h1>
+        <p class="subtitle">Parent Dashboard</p>
+        <input type="password" id="pass" placeholder="Admin password"
+          onkeydown="if(event.key==='Enter')document.getElementById('loginBtn').click()">
+        <button id="loginBtn">Log In</button>
+      </div>
     </div>`;
   document.getElementById('loginBtn').onclick = () => login(document.getElementById('pass').value);
+  document.getElementById('pass').focus();
 }
 
+/* --- Tab Switching --- */
+function switchTab(tab) {
+  activeTab = tab;
+  sessionStorage.setItem('kidsafe_tab', tab);
+  document.querySelectorAll('.tab-btn').forEach(b => b.classList.toggle('active', b.dataset.tab === tab));
+  document.querySelectorAll('.tab-content').forEach(c => c.classList.toggle('active', c.id === 'tab-' + tab));
+}
+
+/* --- Weekly Schedule Helpers --- */
+const DAYS = ['mon','tue','wed','thu','fri','sat','sun'];
+const DAY_LABELS = {mon:'Monday',tue:'Tuesday',wed:'Wednesday',thu:'Thursday',fri:'Friday',sat:'Saturday',sun:'Sunday'};
+
+function getWSEntry(config, day) {
+  if (config.weekly_schedule && config.weekly_schedule[day]) return config.weekly_schedule[day];
+  return { limit_minutes: config.daily_limit_minutes, windows: config.schedule.enabled !== false ? [{start: config.schedule.allowed_start, end: config.schedule.allowed_end}] : [] };
+}
+
+function renderWeeklyEditor(config) {
+  const todayDay = (cachedData.status && cachedData.status.day_of_week) || '';
+  return DAYS.map(day => {
+    const e = getWSEntry(config, day);
+    const isToday = day === todayDay;
+    const windowsHtml = (e.windows || []).map((w, i) =>
+      '<div class="ws-window-row">' +
+        '<input type="time" class="ws-win-start" data-day="'+day+'" data-idx="'+i+'" value="'+w.start+'">' +
+        '<span>to</span>' +
+        '<input type="time" class="ws-win-end" data-day="'+day+'" data-idx="'+i+'" value="'+w.end+'">' +
+        (e.windows.length > 1 ? '<button class="ws-rm-btn" onclick="removeWindow(\\''+day+'\\','+i+')">&times;</button>' : '') +
+      '</div>'
+    ).join('');
+    const canAdd = (e.windows || []).length < 4;
+    return '<div class="ws-day-card'+(isToday?' today':'')+'" data-day="'+day+'">' +
+      '<div class="ws-day-header">' +
+        '<span class="ws-day-name">'+DAY_LABELS[day]+(isToday?'<span class=\\'today-badge\\'>Today</span>':'')+'</span>' +
+        '<div style="display:flex;align-items:center;gap:6px"><label style="font-size:13px;margin:0">Limit:</label><input type="number" class="ws-limit-input" data-day="'+day+'" value="'+e.limit_minutes+'" min="0" max="1440"> min</div>' +
+      '</div>' +
+      windowsHtml +
+      (canAdd ? '<button class="ws-add-btn" onclick="addWindow(\\''+day+'\\')">+ Add window</button>' : '') +
+    '</div>';
+  }).join('');
+}
+
+function toggleWeeklySchedule() {
+  const enabled = document.getElementById('ws_enabled').checked;
+  document.getElementById('ws_editor').style.display = enabled ? '' : 'none';
+  if (!enabled) {
+    api('/config', 'POST', { weekly_schedule: null }).then(() => { toast('Weekly schedule disabled'); render(); });
+  }
+}
+
+function collectWeeklySchedule() {
+  const ws = {};
+  DAYS.forEach(day => {
+    const limitInput = document.querySelector('.ws-limit-input[data-day="'+day+'"]');
+    const startInputs = document.querySelectorAll('.ws-win-start[data-day="'+day+'"]');
+    const endInputs = document.querySelectorAll('.ws-win-end[data-day="'+day+'"]');
+    const windows = [];
+    startInputs.forEach((s, i) => {
+      const e = endInputs[i];
+      if (s.value && e.value) windows.push({start: s.value, end: e.value});
+    });
+    ws[day] = { limit_minutes: parseInt(limitInput.value) || 0, windows };
+  });
+  return ws;
+}
+
+async function saveWeeklySchedule() {
+  const ws = collectWeeklySchedule();
+  const r = await api('/config', 'POST', { weekly_schedule: ws });
+  if (r.ok) { toast('Weekly schedule saved'); render(); }
+  else toast(r.error || 'Validation error', 'error');
+}
+
+function addWindow(day) {
+  const cfg = cachedData.config;
+  if (!cfg.weekly_schedule) cfg.weekly_schedule = {};
+  const e = getWSEntry(cfg, day);
+  if (e.windows.length >= 4) return;
+  e.windows.push({start: '12:00', end: '13:00'});
+  cfg.weekly_schedule[day] = e;
+  render();
+}
+
+function removeWindow(day, idx) {
+  const cfg = cachedData.config;
+  if (!cfg.weekly_schedule) cfg.weekly_schedule = {};
+  const e = getWSEntry(cfg, day);
+  if (e.windows.length <= 1) return;
+  e.windows.splice(idx, 1);
+  cfg.weekly_schedule[day] = e;
+  render();
+}
+
+function copyDaySchedule() {
+  const src = document.getElementById('ws_copy_source').value;
+  const target = document.getElementById('ws_copy_target').value;
+  const srcEntry = { limit_minutes: parseInt(document.querySelector('.ws-limit-input[data-day="'+src+'"]').value) || 0, windows: [] };
+  document.querySelectorAll('.ws-win-start[data-day="'+src+'"]').forEach((s, i) => {
+    const e = document.querySelector('.ws-win-end[data-day="'+src+'"][data-idx="'+i+'"]');
+    if (s.value && e.value) srcEntry.windows.push({start: s.value, end: e.value});
+  });
+  let targetDays = [];
+  if (target === 'weekdays') targetDays = ['mon','tue','wed','thu','fri'];
+  else if (target === 'weekend') targetDays = ['sat','sun'];
+  else targetDays = DAYS.slice();
+  const cfg = cachedData.config;
+  if (!cfg.weekly_schedule) cfg.weekly_schedule = {};
+  targetDays.forEach(d => { cfg.weekly_schedule[d] = JSON.parse(JSON.stringify(srcEntry)); });
+  toast('Copied ' + src + ' to ' + target);
+  render();
+}
+
+/* --- Status Helpers --- */
+function getStatusInfo(status) {
+  if (!status.firefox_running && !status.within_schedule) return { cls: 'outside', label: 'Outside Schedule' };
+  if (status.firefox_running) return { cls: 'active', label: 'Active' };
+  return { cls: 'inactive', label: 'Inactive' };
+}
+
+/* --- Render --- */
 async function render() {
   if (!token) return showLogin();
   const [status, config, history, events] = await Promise.all([
     api('/status'), api('/config'), api('/history'), api('/events')
   ]);
-  if (status.error === 'unauthorized') { token = ''; sessionStorage.removeItem('kidsafe_token'); return showLogin(); }
-
-  const usedPct = Math.min(100, (status.used_minutes / config.daily_limit_minutes) * 100);
+  if (status.error === 'unauthorized') {
+    token = '';
+    sessionStorage.removeItem('kidsafe_token');
+    return showLogin();
+  }
+  cachedData = { status, config, history, events };
+  const si = getStatusInfo(status);
+  const todayLimit = status.limit_minutes || config.daily_limit_minutes;
+  const usedPct = Math.min(100, (status.used_minutes / todayLimit) * 100);
   const barClass = usedPct > 90 ? 'danger' : usedPct > 70 ? 'warning' : '';
+  const maxMin = (history || []).reduce((m, h) => Math.max(m, h.minutes), 1);
+  const avgMin = (history || []).length ? Math.round((history || []).reduce((s, h) => s + h.minutes, 0) / history.length) : 0;
+  const totalWeek = (history || []).reduce((s, h) => s + h.minutes, 0);
 
   app.innerHTML = `
-    <h1>KidSafe</h1>
-    <p class="subtitle">Parental Dashboard for ${config.child_user}</p>
-
-    <div class="card">
-      <div class="stat"><div class="stat-value">${status.remaining_minutes}</div><div class="stat-label">Minutes Left Today</div></div>
-      <div class="stat"><div class="stat-value">${status.used_minutes}</div><div class="stat-label">Minutes Used</div></div>
-      <div class="stat"><div class="stat-value">${status.firefox_running ? 'ON' : 'OFF'}</div><div class="stat-label">Firefox Status</div></div>
-      <div class="bar"><div class="bar-fill ${barClass}" style="width:${usedPct}%"></div></div>
-    </div>
-
-    <h2>Settings</h2>
-    <div class="card">
-      <label>Daily Time Limit (minutes)</label>
-      <div class="form-row">
-        <input type="number" id="limit" value="${config.daily_limit_minutes}" min="1" max="480">
-        <button onclick="saveLimit()">Save</button>
+    <div class="header"><div class="header-inner">
+      <div class="header-left">
+        <span class="header-logo">&#x1F6E1;&#xFE0F; KidSafe</span>
+        <span class="header-child">${config.child_user}</span>
       </div>
-      <label>Schedule</label>
-      <div class="form-row">
-        <input type="time" id="sched_start" value="${config.schedule.allowed_start}">
-        <span>to</span>
-        <input type="time" id="sched_end" value="${config.schedule.allowed_end}">
-        <button onclick="saveSchedule()">Save</button>
+      <div class="header-right">
+        <span class="status-badge ${si.cls}"><span class="status-dot"></span>${si.label}</span>
+        <span class="header-time">${status.remaining_minutes}m left</span>
+        <button class="header-logout" onclick="logout()">Log out</button>
       </div>
-      <label>Homepage</label>
-      <div class="form-row">
-        <input type="url" id="homepage" value="${config.homepage}">
-        <button onclick="saveHomepage()">Save</button>
+    </div></div>
+
+    <div class="tab-bar"><div class="tab-bar-inner">
+      <button class="tab-btn${activeTab==='overview'?' active':''}" data-tab="overview" onclick="switchTab('overview')">Overview</button>
+      <button class="tab-btn${activeTab==='activity'?' active':''}" data-tab="activity" onclick="switchTab('activity')">Activity</button>
+      <button class="tab-btn${activeTab==='analytics'?' active':''}" data-tab="analytics" onclick="switchTab('analytics')">Analytics</button>
+      <button class="tab-btn${activeTab==='settings'?' active':''}" data-tab="settings" onclick="switchTab('settings')">Settings</button>
+    </div></div>
+
+    <div class="main">
+
+      <!-- OVERVIEW TAB -->
+      <div id="tab-overview" class="tab-content${activeTab==='overview'?' active':''}">
+        <div class="card">
+          <div class="stats-grid">
+            <div class="stat"><div class="stat-value">${status.remaining_minutes}</div><div class="stat-label">Minutes Left</div></div>
+            <div class="stat"><div class="stat-value">${status.used_minutes}</div><div class="stat-label">Used Today</div></div>
+            <div class="stat"><div class="stat-value">${status.firefox_running ? 'ON' : 'OFF'}</div><div class="stat-label">Firefox</div></div>
+          </div>
+          <div class="bar-label"><span>${status.used_minutes} of ${todayLimit} min${status.day_of_week ? ' ('+status.day_of_week+')' : ''}</span><span>${Math.round(usedPct)}%</span></div>
+          <div class="bar"><div class="bar-fill ${barClass}" style="width:${usedPct}%"></div></div>
+        </div>
+        <div class="card">
+          <div class="card-title">Quick Controls</div>
+          <div class="controls-grid">
+            <button class="ctrl-btn primary" onclick="resetTime()">Reset Time</button>
+            <button class="ctrl-btn secondary" onclick="applyPolicies()">Apply Policies</button>
+            <button class="ctrl-btn danger" onclick="stopKiosk()">Stop Kiosk</button>
+          </div>
+        </div>
       </div>
-    </div>
 
-    <h2>Allowed Sites</h2>
-    <div class="card">
-      <div id="sites">${config.allowed_sites.map(s => `<span class="tag">${s}<span class="remove" onclick="removeSite('${s}')">&times;</span></span>`).join(' ')}</div>
-      <div class="form-row" style="margin-top:12px">
-        <input type="text" id="newsite" placeholder="example.com">
-        <button onclick="addSite()">Add</button>
+      <!-- ACTIVITY TAB -->
+      <div id="tab-activity" class="tab-content${activeTab==='activity'?' active':''}">
+        <div class="card">
+          <div class="card-title">Recent Activity</div>
+          ${(events || []).length === 0 ? '<div class="empty">No recent events</div>' : `
+          <div style="overflow-x:auto">
+          <table><tr><th>Time</th><th>Event</th><th>Detail</th></tr>
+            ${(events || []).slice(0, 50).map(e => `<tr>
+              <td>${new Date(e.time).toLocaleString([], {month:'short',day:'numeric',hour:'2-digit',minute:'2-digit'})}</td>
+              <td><span class="event-type ${e.type}">${e.type.replace(/_/g, ' ')}</span></td>
+              <td>${e.detail || '\\u2014'}</td>
+            </tr>`).join('')}
+          </table></div>`}
+        </div>
       </div>
-    </div>
 
-    <h2>Usage History (7 days)</h2>
-    <div class="card">
-      <table><tr><th>Date</th><th>Minutes</th></tr>
-        ${(history || []).map(h => `<tr><td>${h.date}</td><td>${h.minutes}</td></tr>`).join('')}
-      </table>
-    </div>
+      <!-- ANALYTICS TAB -->
+      <div id="tab-analytics" class="tab-content${activeTab==='analytics'?' active':''}">
+        <div class="card">
+          <div class="card-title">Weekly Usage</div>
+          ${(history || []).length === 0 ? '<div class="empty">No usage data yet</div>' : `
+          ${(history || []).map(h => {
+            const pct = Math.round((h.minutes / maxMin) * 100);
+            return `<div class="chart-bar-row">
+              <span class="chart-label">${h.date.slice(5)}</span>
+              <div class="chart-track"><div class="chart-fill" style="width:${pct}%"></div></div>
+              <span class="chart-value">${h.minutes}m</span>
+            </div>`;
+          }).join('')}`}
+        </div>
+        <div class="card">
+          <div class="card-title">Trends</div>
+          <div class="trend-grid">
+            <div class="trend-card"><div class="trend-value" style="color:var(--blue)">${avgMin}</div><div class="trend-label">Avg Min / Day</div></div>
+            <div class="trend-card"><div class="trend-value" style="color:var(--green)">${totalWeek}</div><div class="trend-label">Total This Week</div></div>
+            <div class="trend-card"><div class="trend-value" style="color:var(--orange)">${todayLimit}</div><div class="trend-label">Today's Limit</div></div>
+            <div class="trend-card"><div class="trend-value" style="color:${usedPct > 90 ? 'var(--red)' : 'var(--blue)'}">${Math.round(usedPct)}%</div><div class="trend-label">Used Today</div></div>
+          </div>
+        </div>
+      </div>
 
-    <h2>Recent Activity</h2>
-    <div class="card">
-      <table><tr><th>Time</th><th>Event</th><th>Detail</th></tr>
-        ${(events || []).slice(0, 20).map(e => `<tr><td>${new Date(e.time).toLocaleString()}</td><td><span class="event-type ${e.type}">${e.type}</span></td><td>${e.detail || ''}</td></tr>`).join('')}
-      </table>
-    </div>
+      <!-- SETTINGS TAB -->
+      <div id="tab-settings" class="tab-content${activeTab==='settings'?' active':''}">
+        <div class="card">
+          <div class="card-title">Time Limit</div>
+          <div class="form-group">
+            <label>Daily limit (minutes)</label>
+            <div class="form-row">
+              <input type="number" id="limit" value="${config.daily_limit_minutes}" min="1" max="480">
+              <button class="save-btn" onclick="saveLimit()">Save</button>
+            </div>
+          </div>
+        </div>
+        <div class="card">
+          <div class="card-title">Schedule (Default)</div>
+          <div class="form-group">
+            <label>Allowed hours (used when weekly schedule is off)</label>
+            <div class="form-row">
+              <input type="time" id="sched_start" value="${config.schedule.allowed_start}">
+              <span>to</span>
+              <input type="time" id="sched_end" value="${config.schedule.allowed_end}">
+              <button class="save-btn" onclick="saveSchedule()">Save</button>
+            </div>
+          </div>
+        </div>
+        <div class="card">
+          <div class="card-title">Weekly Schedule</div>
+          <div class="ws-toggle">
+            <label class="ws-switch"><input type="checkbox" id="ws_enabled" ${config.weekly_schedule ? 'checked' : ''} onchange="toggleWeeklySchedule()"><span class="ws-slider"></span></label>
+            <label>Use per-day limits and time windows</label>
+          </div>
+          <div id="ws_editor" style="${config.weekly_schedule ? '' : 'display:none'}">
+            <div class="ws-copy-row">
+              <span>Copy settings from</span>
+              <select id="ws_copy_source">${['mon','tue','wed','thu','fri','sat','sun'].map(d => '<option value="'+d+'">'+d+'</option>').join('')}</select>
+              <span>to</span>
+              <select id="ws_copy_target"><option value="weekdays">Weekdays</option><option value="weekend">Weekend</option><option value="all">All days</option></select>
+              <button class="save-btn" onclick="copyDaySchedule()" style="padding:6px 12px;font-size:13px">Copy</button>
+            </div>
+            ${renderWeeklyEditor(config)}
+            <button class="save-btn" onclick="saveWeeklySchedule()" style="margin-top:8px">Save Weekly Schedule</button>
+          </div>
+        </div>
+        <div class="card">
+          <div class="card-title">Homepage</div>
+          <div class="form-group">
+            <label>Default page when Firefox opens</label>
+            <div class="form-row">
+              <input type="url" id="homepage" value="${config.homepage}">
+              <button class="save-btn" onclick="saveHomepage()">Save</button>
+            </div>
+          </div>
+        </div>
+        <div class="card">
+          <div class="card-title">Allowed Sites</div>
+          <div class="tag-list" id="sites">${config.allowed_sites.map(s => `<span class="tag">${s}<span class="remove" onclick="removeSite('${s}')">&times;</span></span>`).join('')}</div>
+          <div class="form-row">
+            <input type="text" id="newsite" placeholder="example.com"
+              onkeydown="if(event.key==='Enter')addSite()">
+            <button class="save-btn" onclick="addSite()">Add Site</button>
+          </div>
+        </div>
+      </div>
 
-    <h2>Controls</h2>
-    <div class="card">
-      <button onclick="resetTime()">Reset Today's Time</button>
-      <button onclick="applyPolicies()">Apply Firefox Policies</button>
-      <button class="danger" onclick="stopKiosk()">Stop Kiosk</button>
     </div>`;
 }
 
+/* --- Actions --- */
 async function saveLimit() {
   await api('/config', 'POST', { daily_limit_minutes: parseInt(document.getElementById('limit').value) });
+  toast('Time limit saved');
   render();
 }
 async function saveSchedule() {
   await api('/config', 'POST', { schedule: { enabled: true, allowed_start: document.getElementById('sched_start').value, allowed_end: document.getElementById('sched_end').value }});
+  toast('Schedule saved');
   render();
 }
 async function saveHomepage() {
   await api('/config', 'POST', { homepage: document.getElementById('homepage').value });
+  toast('Homepage saved');
   render();
 }
 async function addSite() {
-  const site = document.getElementById('newsite').value.trim().replace(/^https?:\\/\\//, '').replace(/\\/+$/, '');
+  const input = document.getElementById('newsite');
+  const site = input.value.trim().replace(/^https?:\\/\\//, '').replace(/\\/+$/, '');
   if (!site) return;
   const cfg = await api('/config');
+  if (cfg.allowed_sites.includes(site)) { toast('Site already allowed', 'info'); return; }
   cfg.allowed_sites.push(site);
   await api('/config', 'POST', { allowed_sites: cfg.allowed_sites });
+  toast(site + ' added');
   render();
 }
 async function removeSite(site) {
   const cfg = await api('/config');
   cfg.allowed_sites = cfg.allowed_sites.filter(s => s !== site);
   await api('/config', 'POST', { allowed_sites: cfg.allowed_sites });
+  toast(site + ' removed');
   render();
 }
 async function resetTime() {
-  if (confirm('Reset today\\'s time usage to zero?')) { await api('/reset-time', 'POST'); render(); }
+  if (confirm('Reset today\\'s time usage to zero?')) {
+    await api('/reset-time', 'POST');
+    toast('Time reset to zero');
+    render();
+  }
 }
 async function applyPolicies() {
   const r = await api('/apply-policies', 'POST');
-  alert(r.message || 'Done');
+  toast(r.message || 'Policies applied', r.ok ? 'success' : 'error');
 }
 async function stopKiosk() {
-  if (confirm('Stop the kiosk? Firefox will close.')) { await api('/stop-kiosk', 'POST'); render(); }
+  if (confirm('Stop the kiosk? Firefox will close.')) {
+    await api('/stop-kiosk', 'POST');
+    toast('Kiosk stopped');
+    render();
+  }
 }
 
 render();
@@ -857,28 +1524,62 @@ setInterval(render, 30000);
 class DashboardHandler(BaseHTTPRequestHandler):
     """HTTP handler for the parent dashboard."""
 
-    server_version = "KidSafe/1.0"
-    config = None
-    kiosk = None
-    auth_tokens = set()
+    server_version: str = "KidSafe/1.0"
+    config: Optional[Dict[str, Any]] = None
+    kiosk: Optional[KioskManager] = None
+    auth_tokens: Set[str] = set()
 
-    def log_message(self, format, *args):
+    def log_message(self, format: str, *args: object) -> None:
         """Suppress default HTTP logging."""
         pass
 
-    def send_json(self, data, status=200):
+    def send_json(self, data: Any, status: int = 200) -> None:
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
         self.end_headers()
         self.wfile.write(json.dumps(data).encode())
 
-    def check_auth(self):
+    def get_client_ip(self) -> str:
+        """Get the client's IP address."""
+        return self.client_address[0]
+
+    def check_ip_allowed(self) -> bool:
+        """Check if the client IP is allowed by remote_access config.
+
+        Localhost (127.0.0.1, ::1) is always allowed.
+        When remote_access is disabled, only localhost is allowed.
+        When remote_access is enabled with allowed_ips, check the list.
+        When remote_access is enabled with empty allowed_ips, all IPs allowed.
+        """
+        client_ip = self.get_client_ip()
+        if client_ip in ("127.0.0.1", "::1"):
+            return True
+        assert DashboardHandler.config is not None
+        remote_cfg = DashboardHandler.config.get("remote_access", {})
+        if not remote_cfg.get("enabled", False):
+            return False
+        return is_ip_allowed(client_ip, remote_cfg.get("allowed_ips", []))
+
+    def log_remote_request(self) -> None:
+        """Log remote (non-localhost) requests to the events table."""
+        client_ip = self.get_client_ip()
+        if client_ip not in ("127.0.0.1", "::1"):
+            record_event("remote_access", f"{client_ip} {self.command} {self.path}")
+
+    def check_auth(self) -> bool:
         auth = self.headers.get("Authorization", "")
         if auth.startswith("Bearer "):
             return auth[7:] in DashboardHandler.auth_tokens
         return False
 
-    def do_GET(self):
+    def do_GET(self) -> None:
+        if not self.check_ip_allowed():
+            self.send_json({"error": "forbidden"}, 403)
+            record_event("remote_blocked", f"{self.get_client_ip()} GET {self.path}")
+            return
+
+        self.log_remote_request()
+
         if self.path == "/" or self.path == "/dashboard":
             self.send_response(200)
             self.send_header("Content-Type", "text/html")
@@ -890,13 +1591,17 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self.send_json({"error": "unauthorized"}, 401)
             return
 
+        assert DashboardHandler.config is not None
         if self.path == "/api/status":
             used = get_today_usage()
-            limit = DashboardHandler.config["daily_limit_minutes"] * 60
+            today = get_today_schedule(DashboardHandler.config)
+            limit = today["limit_minutes"] * 60
             self.send_json({
                 "used_minutes": used // 60,
                 "remaining_minutes": max(0, (limit - used)) // 60,
-                "limit_minutes": DashboardHandler.config["daily_limit_minutes"],
+                "limit_minutes": today["limit_minutes"],
+                "today_windows": today["windows"],
+                "day_of_week": get_today_day_key(),
                 "firefox_running": DashboardHandler.kiosk.is_firefox_running() if DashboardHandler.kiosk else False,
                 "within_schedule": DashboardHandler.kiosk.is_within_schedule() if DashboardHandler.kiosk else True
             })
@@ -910,17 +1615,32 @@ class DashboardHandler(BaseHTTPRequestHandler):
         else:
             self.send_json({"error": "not found"}, 404)
 
-    def do_POST(self):
-        content_length = int(self.headers.get("Content-Length", 0))
-        body = json.loads(self.rfile.read(content_length)) if content_length > 0 else {}
+    def do_POST(self) -> None:
+        if not self.check_ip_allowed():
+            self.send_json({"error": "forbidden"}, 403)
+            record_event("remote_blocked", f"{self.get_client_ip()} POST {self.path}")
+            return
+
+        self.log_remote_request()
+
+        assert DashboardHandler.config is not None
+        content_length = int(self.headers.get("Content-Length", "0"))
+        body: Dict[str, Any] = json.loads(self.rfile.read(content_length)) if content_length > 0 else {}
 
         if self.path == "/api/login":
-            password = body.get("password", "")
-            if verify_password(password, DashboardHandler.config.get("admin_password_hash")):
+            client_ip = self.get_client_ip()
+            if not login_rate_limiter.is_allowed(client_ip):
+                self.send_json({"error": "too many login attempts, try again later"}, 429)
+                record_event("rate_limited", f"{client_ip} login attempt blocked")
+                return
+            password: str = body.get("password", "")
+            if verify_password(password, DashboardHandler.config.get("admin_password_hash", "")):
                 token = secrets.token_hex(32)
                 DashboardHandler.auth_tokens.add(token)
+                record_event("login_success", f"{client_ip}")
                 self.send_json({"token": token})
             else:
+                record_event("login_failed", f"{client_ip}")
                 self.send_json({"error": "invalid password"}, 401)
             return
 
@@ -929,6 +1649,11 @@ class DashboardHandler(BaseHTTPRequestHandler):
             return
 
         if self.path == "/api/config":
+            if "weekly_schedule" in body:
+                err = validate_weekly_schedule(body["weekly_schedule"])
+                if err:
+                    self.send_json({"ok": False, "error": err}, 400)
+                    return
             DashboardHandler.config.update(body)
             save_config(DashboardHandler.config)
             record_event("config_update", json.dumps(body))
@@ -948,21 +1673,33 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self.send_json({"error": "not found"}, 404)
 
 
-def run_dashboard(config, kiosk, port=8484):
+def run_dashboard(config: Dict[str, Any], kiosk: KioskManager, port: int = 8484) -> None:
     """Start the parent dashboard web server."""
     DashboardHandler.config = config
     DashboardHandler.kiosk = kiosk
-    server = HTTPServer(("127.0.0.1", port), DashboardHandler)
-    log(f"Dashboard running at http://127.0.0.1:{port}")
+    remote_cfg = config.get("remote_access", {})
+    if remote_cfg.get("enabled", False):
+        bind_addr = remote_cfg.get("bind_address", "0.0.0.0")
+        local_ip = get_local_ip()
+        log(f"Dashboard running at http://{local_ip}:{port} (remote access enabled)")
+        allowed = remote_cfg.get("allowed_ips", [])
+        if allowed:
+            log(f"  Allowed IPs: {', '.join(allowed)}")
+        else:
+            log(f"  Allowed IPs: all (no restrictions)")
+    else:
+        bind_addr = "127.0.0.1"
+        log(f"Dashboard running at http://127.0.0.1:{port}")
+    server = HTTPServer((bind_addr, port), DashboardHandler)
     server.serve_forever()
 
 
 # --- CLI ---
 
-def cmd_setup(args):
+def cmd_setup(args: List[str]) -> None:
     """Interactive setup (or non-interactive with flags)."""
     # Parse flags for non-interactive mode
-    flags = {}
+    flags: Dict[str, str] = {}
     i = 0
     while i < len(args):
         if args[i] == "--child" and i + 1 < len(args):
@@ -975,6 +1712,12 @@ def cmd_setup(args):
             flags["limit"] = args[i + 1]; i += 2
         elif args[i] == "--homepage" and i + 1 < len(args):
             flags["homepage"] = args[i + 1]; i += 2
+        elif args[i] == "--remote":
+            flags["remote"] = "true"; i += 1
+        elif args[i] == "--no-remote":
+            flags["remote"] = "false"; i += 1
+        elif args[i] == "--allowed-ips" and i + 1 < len(args):
+            flags["allowed_ips"] = args[i + 1]; i += 2
         else:
             i += 1
 
@@ -1017,18 +1760,51 @@ def cmd_setup(args):
         if homepage:
             config["homepage"] = homepage
 
+    # Remote access configuration
+    if "remote_access" not in config:
+        config["remote_access"] = {"enabled": False, "bind_address": "0.0.0.0", "allowed_ips": []}
+
+    if "remote" in flags:
+        config["remote_access"]["enabled"] = flags["remote"] == "true"
+        if "allowed_ips" in flags:
+            ips = [ip.strip() for ip in flags["allowed_ips"].split(",") if ip.strip()]
+            config["remote_access"]["allowed_ips"] = ips
+    else:
+        current_remote = config["remote_access"].get("enabled", False)
+        default_yn = "Y/n" if current_remote else "y/N"
+        remote_input = input(f"\nEnable remote access from other devices on your network? [{default_yn}]: ").strip().lower()
+        if remote_input:
+            config["remote_access"]["enabled"] = remote_input in ("y", "yes")
+        # If unchanged and already set, keep it
+
+        if config["remote_access"]["enabled"]:
+            current_ips = config["remote_access"].get("allowed_ips", [])
+            current_str = ", ".join(current_ips) if current_ips else "all"
+            print(f"  Restrict to specific IPs/CIDRs (comma-separated), or leave blank for any device.")
+            ip_input = input(f"  Allowed IPs [{current_str}]: ").strip()
+            if ip_input:
+                config["remote_access"]["allowed_ips"] = [ip.strip() for ip in ip_input.split(",") if ip.strip()]
+            elif not current_ips:
+                config["remote_access"]["allowed_ips"] = []
+
     save_config(config)
     init_db()
 
     print("\nApplying Firefox policies...")
     apply_firefox_policies(config)
 
+    port = config["admin_port"]
     print(f"\nSetup complete! Config saved to {CONFIG_FILE}")
     print(f"Run 'kidsafe start' to launch the kiosk.")
-    print(f"Parent dashboard: http://127.0.0.1:{config['admin_port']}")
+    if config["remote_access"].get("enabled", False):
+        local_ip = get_local_ip()
+        print(f"Parent dashboard: http://{local_ip}:{port} (remote access enabled)")
+        print(f"Run 'kidsafe remote' to see the URL and QR code.")
+    else:
+        print(f"Parent dashboard: http://127.0.0.1:{port}")
 
 
-def cmd_start(args):
+def cmd_start(args: List[str]) -> None:
     """Start the kiosk and dashboard."""
     config = load_config()
     init_db()
@@ -1050,7 +1826,7 @@ def cmd_start(args):
     dashboard_thread.start()
 
     # Handle SIGTERM gracefully
-    def handle_signal(signum, frame):
+    def handle_signal(signum: int, frame: Optional[FrameType]) -> None:
         log("Received shutdown signal")
         kiosk.stop()
 
@@ -1061,7 +1837,7 @@ def cmd_start(args):
     kiosk.run()
 
 
-def cmd_stop(args):
+def cmd_stop(args: List[str]) -> None:
     """Stop the kiosk by finding and killing the process."""
     try:
         result = subprocess.run(
@@ -1079,28 +1855,37 @@ def cmd_stop(args):
         print(f"Error: {e}")
 
 
-def cmd_status(args):
+def cmd_status(args: List[str]) -> None:
     """Show current status."""
     config = load_config()
     used = get_today_usage()
-    limit = config["daily_limit_minutes"] * 60
+    today = get_today_schedule(config)
+    limit = today["limit_minutes"] * 60
     remaining = max(0, (limit - used)) // 60
 
     print(f"Child user:    {config['child_user']}")
-    print(f"Today's usage: {used // 60} minutes")
-    print(f"Remaining:     {remaining} minutes")
-    print(f"Daily limit:   {config['daily_limit_minutes']} minutes")
-    print(f"Schedule:      {config['schedule']['allowed_start']} - {config['schedule']['allowed_end']}")
-    print(f"Dashboard:     http://127.0.0.1:{config['admin_port']}")
+    print(f"Today ({get_today_day_key()}):  {used // 60} min used, {remaining} min left")
+    print(f"Daily limit:   {today['limit_minutes']} minutes")
+    if today["windows"]:
+        windows_str = ", ".join(f"{w['start']}-{w['end']}" for w in today["windows"])
+        print(f"Schedule:      {windows_str}")
+    else:
+        print("Schedule:      No restrictions")
+    remote_cfg = config.get("remote_access", {})
+    if remote_cfg.get("enabled", False):
+        local_ip = get_local_ip()
+        print(f"Dashboard:     http://{local_ip}:{config['admin_port']} (remote)")
+    else:
+        print(f"Dashboard:     http://127.0.0.1:{config['admin_port']}")
 
 
-def cmd_reset(args):
+def cmd_reset(args: List[str]) -> None:
     """Reset today's time."""
     update_daily_usage(0)
     print("Today's usage reset to zero.")
 
 
-def cmd_policies(args):
+def cmd_policies(args: List[str]) -> None:
     """Apply Firefox policies."""
     config = load_config()
     if apply_firefox_policies(config):
@@ -1109,7 +1894,76 @@ def cmd_policies(args):
         print("Failed to apply policies. Try with sudo.")
 
 
-def main():
+def generate_qr_ascii(url: str) -> Optional[str]:
+    """Generate ASCII QR code for a URL. Requires 'qrcode' pip package.
+
+    Returns None if qrcode is not installed.
+    """
+    try:
+        import io
+        qr_mod = __import__("qrcode")
+        qr = qr_mod.QRCode(
+            version=1,
+            error_correction=qr_mod.constants.ERROR_CORRECT_L,
+            box_size=1,
+            border=1,
+        )
+        qr.add_data(url)
+        qr.make(fit=True)
+        f = io.StringIO()
+        qr.print_ascii(out=f)
+        return f.getvalue()
+    except ImportError:
+        return None
+
+
+def cmd_remote(args: List[str]) -> None:
+    """Show remote dashboard access info with local IP and optional QR code."""
+    config = load_config()
+    port = config["admin_port"]
+    remote_cfg = config.get("remote_access", {})
+    local_ip = get_local_ip()
+
+    print("=== KidSafe Remote Access ===\n")
+
+    if not remote_cfg.get("enabled", False):
+        print("Remote access is DISABLED.")
+        print(f"Dashboard is only accessible at: http://127.0.0.1:{port}")
+        print()
+        print("To enable remote access, run 'kidsafe setup' or edit config:")
+        print(f"  {CONFIG_FILE}")
+        print()
+        print('Set "remote_access": {"enabled": true} to allow LAN access.')
+        return
+
+    url = f"http://{local_ip}:{port}"
+    print(f"Remote access is ENABLED")
+    print(f"Local IP:     {local_ip}")
+    print(f"Dashboard:    {url}")
+    print()
+
+    allowed = remote_cfg.get("allowed_ips", [])
+    if allowed:
+        print(f"Allowed IPs:  {', '.join(allowed)}")
+    else:
+        print("Allowed IPs:  all (any device on this network)")
+    print()
+
+    # Show QR code
+    if "--no-qr" not in args:
+        qr_text = generate_qr_ascii(url)
+        if qr_text:
+            print("Scan this QR code with your phone:\n")
+            print(qr_text)
+        else:
+            print("Tip: Install 'qrcode' for a scannable QR code:")
+            print("  pip3 install qrcode")
+            print()
+
+    print("Open the URL above on any device connected to this Wi-Fi network.")
+
+
+def main() -> None:
     if len(sys.argv) < 2:
         print("KidSafe - Parental Control Kiosk for macOS")
         print()
@@ -1122,6 +1976,7 @@ def main():
         print("  status    Show current status")
         print("  reset     Reset today's time usage")
         print("  policies  Apply Firefox policies")
+        print("  remote    Show remote access URL and QR code")
         sys.exit(0)
 
     commands = {
@@ -1131,6 +1986,7 @@ def main():
         "status": cmd_status,
         "reset": cmd_reset,
         "policies": cmd_policies,
+        "remote": cmd_remote,
     }
 
     cmd = sys.argv[1]
